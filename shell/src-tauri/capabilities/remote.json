@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "fizmat-remote",
+  "description": "Страницы fizmat.ai зовут команду guard — проверить и скрыть личные данные.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://fizmat.ai/*", "https://*.fizmat.ai/*"]
+  },
+  "permissions": ["core:default", "allow-guard"]
+}

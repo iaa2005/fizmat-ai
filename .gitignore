@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+model/
+onnx/
+build/
+dist-guard/
+shell/node_modules/
+shell/src-tauri/target/
+shell/src-tauri/gen/
+*.log

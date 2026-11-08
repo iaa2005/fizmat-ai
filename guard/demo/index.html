@@ -1,0 +1,25 @@
+<!doctype html><meta charset="utf-8"><title>Проба FizmatGuard</title>
+<script>window.__FZ_GUARD = { url: 'http://127.0.0.1:47821', token: 'VQVT8ca-ZUuN9oFKYFXlRqJoJNFI5yabFO81DzHzHQc' };</script>
+<script src="/inject.js"></script>
+<body style="font:15px Manrope,system-ui;max-width:640px;margin:40px auto">
+<div id="feed"></div>
+<textarea id="input" rows="3" style="width:100%">Меня зовут Игорь Валентинович Ступин, телефон 8 (903) 111-22-33, СНИЛС 112-233-445 95. У меня диабет.</textarea>
+<button id="go">Отправить</button>
+<script>
+const feed = document.getElementById('feed');
+const line = (who, t) => { const p = document.createElement('p'); p.innerHTML = '<b>' + who + ':</b> '; p.append(t); feed.append(p); return p; };
+window.SENT = [];
+// Подменяем сервер: запоминаем, что ушло, и отвечаем «моделью», которая видит только метки.
+const realFetch = window.fetch;
+document.getElementById('go').onclick = async () => {
+  const input = document.getElementById('input'); const q = input.value; input.value = '';
+  line('Я', q);
+  const res = await fetch('/c/x/messages', { method: 'POST', body: JSON.stringify({ q }), headers: { 'Content-Type': 'application/json' } });
+  if (res.status === 422) { line('Сайт', (await res.json()).message); return; }
+  const { got } = await res.json();
+  // Что реально ушло на сервер — в поле, его прослойка не трогает.
+  const raw = document.createElement('textarea'); raw.id = 'raw'; raw.readOnly = true; raw.value = got; raw.style.width = '100%';
+  line('Дошло до сайта', raw);
+  line('Fizmat', 'Здравствуйте, [ИМЯ_1]! Перезвоню на [ТЕЛЕФОН_1], СНИЛС [СНИЛС_1] проверю.');
+};
+</script>

@@ -1,0 +1,147 @@
+// Fizmat с защитой личных данных: окно с fizmat.ai, рядом — локальная прослойка
+// (PII-Tracer + правила, guard/server.py). Страница зовёт команду guard, программа
+// передаёт запрос прослойке с ключом; сама страница ключа не видит.
+// В установленной программе прослойка — guard/guard.exe среди ресурсов (PyInstaller),
+// модель она скачивает сама при первом запуске; в сборке для себя — server.py из .venv.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use serde_json::Value;
+use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+
+const PORT: u16 = 47821;
+const START_URL: &str = "https://fizmat.ai/home";
+const INJECT: &str = include_str!("../../../guard/inject.js");
+
+struct Guard {
+    token: String,
+    child: Mutex<Option<Child>>,
+}
+
+fn home() -> PathBuf {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    base.join("FizmatGuard")
+}
+
+/// Ключ прослойки: общий с server.py через файл, создаётся один раз.
+fn token() -> String {
+    let path = home().join("token");
+    if let Ok(t) = fs::read_to_string(&path) {
+        if !t.trim().is_empty() {
+            return t.trim().to_string();
+        }
+    }
+    let t = uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
+    let _ = fs::create_dir_all(home());
+    let _ = fs::write(&path, &t);
+    t
+}
+
+/// Папка guard/: из FIZMAT_GUARD_DIR, рядом с программой или в исходниках (сборка для себя).
+fn guard_dir() -> Option<PathBuf> {
+    let has = |p: &Path| p.join("server.py").exists();
+    if let Some(dir) = std::env::var_os("FIZMAT_GUARD_DIR").map(PathBuf::from) {
+        if has(&dir) {
+            return Some(dir);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for up in exe.ancestors() {
+            if has(&up.join("guard")) {
+                return Some(up.join("guard"));
+            }
+        }
+    }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guard");
+    has(&dev).then_some(dev)
+}
+
+fn alive() -> bool {
+    ureq::get(&format!("http://127.0.0.1:{PORT}/health"))
+        .timeout(Duration::from_millis(400))
+        .call()
+        .is_ok()
+}
+
+/// Запуск прослойки без окна консоли. Уже запущенную (вторая копия программы) не трогаем.
+fn start_service(resources: Option<PathBuf>) -> Option<Child> {
+    if alive() {
+        return None;
+    }
+    let bundled = resources.map(|r| r.join("guard").join("guard.exe")).filter(|p| p.exists());
+    let mut cmd = match bundled {
+        Some(exe) => {
+            let mut c = Command::new(&exe);
+            c.current_dir(exe.parent()?);
+            c
+        }
+        None => {
+            let dir = guard_dir()?;
+            let mut c = Command::new(dir.join("../.venv/Scripts/python.exe"));
+            c.arg("server.py").current_dir(&dir);
+            c
+        }
+    };
+    let _ = fs::create_dir_all(home());
+    let log = fs::File::create(home().join("guard.log")).ok()?;
+    cmd.arg(PORT.to_string())
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::null()).stdout(log.try_clone().ok()?).stderr(log);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.spawn().ok()
+}
+
+/// Запрос страницы к прослойке. Только три пути и здоровье — больше страница ничего не может.
+#[tauri::command]
+fn guard(path: String, body: Option<Value>, state: tauri::State<Guard>) -> Result<Value, String> {
+    let url = format!("http://127.0.0.1:{PORT}{path}");
+    let res = match path.as_str() {
+        "/health" => ureq::get(&url).timeout(Duration::from_secs(2)).call(),
+        "/scan" | "/mask" | "/restore" | "/vault" | "/vault/clear" => ureq::post(&url)
+            .set("X-Guard-Token", &state.token)
+            .timeout(Duration::from_secs(60))
+            .send_json(body.unwrap_or(Value::Null)),
+        _ => return Err("нет такого пути".into()),
+    };
+    match res {
+        Ok(r) => r.into_json::<Value>().map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("прослойка ответила {code}")),
+        Err(_) => Err("прослойка ещё запускается".into()),
+    }
+}
+
+fn main() {
+    let app = tauri::Builder::default()
+        .manage(Guard { token: token(), child: Mutex::new(None) })
+        .invoke_handler(tauri::generate_handler![guard])
+        .setup(|app| {
+            *app.state::<Guard>().child.lock().unwrap() = start_service(app.path().resource_dir().ok());
+            let script = format!("window.__FZ_GUARD = {{ ipc: true }};\n{INJECT}");
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(START_URL.parse().unwrap()))
+                .title("Fizmat")
+                .inner_size(1280.0, 860.0)
+                .min_inner_size(420.0, 560.0)
+                .initialization_script(&script)
+                .build()?;
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("не запустилась оболочка");
+
+    app.run(|handle, event| {
+        if let RunEvent::Exit = event {
+            if let Some(mut child) = handle.state::<Guard>().child.lock().unwrap().take() {
+                let _ = child.kill();
+            }
+        }
+    });
+}
