@@ -4,17 +4,17 @@
 <!-- Строка быстрого вопроса по щелчку на значок в трее (src-tauri/src/tray.rs): появляется из
      размытия, Enter — новый чат на fizmat.ai моделью по умолчанию, Esc — спрятать. -->
 <style>
-    @font-face { font-family: Manrope; src: local("Manrope"); }
     html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
     body { display: flex; align-items: center; justify-content: center; font: 16px/1.4 Manrope, "Segoe UI", system-ui, sans-serif; }
     .bar { width: 620px; height: 56px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 18px;
-        border-radius: 16px; background: rgba(38, 37, 34, .92); color: #f5f4ef; border: 1px solid rgba(255, 255, 255, .09);
-        box-shadow: 0 14px 40px rgba(0, 0, 0, .35); backdrop-filter: blur(18px); }
+        border-radius: 16px; background: rgba(38, 37, 34, .96); color: #f5f4ef; border: 1px solid rgba(255, 255, 255, .09);
+        box-shadow: 0 14px 40px rgba(0, 0, 0, .35); }
     @media (prefers-color-scheme: light) {
-        .bar { background: rgba(250, 249, 245, .94); color: #1f1e1d; border-color: rgba(0, 0, 0, .08); box-shadow: 0 14px 40px rgba(0, 0, 0, .18); }
+        .bar { background: rgba(250, 249, 245, .97); color: #1f1e1d; border-color: rgba(0, 0, 0, .08); box-shadow: 0 14px 40px rgba(0, 0, 0, .18); }
         input::placeholder { color: #8a877f; }
     }
-    .bar.appear { animation: appear .26s cubic-bezier(.2, .8, .2, 1); }
+    /* Окно проявляется целиком (glass.rs), строка — из размытия. */
+    .bar.appear { animation: appear .28s cubic-bezier(.2, .8, .2, 1) both; }
     @keyframes appear {
         from { opacity: 0; filter: blur(10px); transform: scale(.97) translateY(6px); }
         to { opacity: 1; filter: blur(0); transform: none; }
@@ -34,7 +34,14 @@
     const q = document.getElementById('q');
     const invoke = (cmd, args) => window.__TAURI__?.core?.invoke(cmd, args);
 
+    // Перед тем как окно спрячут: пустой кадр — с него начнётся следующий показ.
+    window.fzReset = () => {
+        bar.classList.remove('appear');
+        bar.style.opacity = '0';
+    };
+
     window.fzAppear = () => {
+        bar.style.opacity = '';
         bar.classList.remove('appear');
         void bar.offsetWidth;
         bar.classList.add('appear');

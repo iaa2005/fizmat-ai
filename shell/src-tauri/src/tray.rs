@@ -53,7 +53,7 @@ fn quick(app: &AppHandle) {
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(150));
                         if !hide.is_focused().unwrap_or(false) {
-                            let _ = hide.hide();
+                            crate::glass::vanish(&hide);
                         }
                     });
                 }
@@ -71,10 +71,7 @@ fn quick(app: &AppHandle) {
     if std::env::var_os("FIZMAT_QUICK").is_some() {
         code::note("quick", &format!("show at {:?} size {:?}", window.outer_position(), window.outer_size()));
     }
-    let _ = window.show();
-    let _ = window.set_focus();
-    // Страница проигрывает появление из размытия и ставит курсор в поле.
-    let _ = window.eval("window.fzAppear && window.fzAppear()");
+    crate::glass::appear(&window);
 }
 
 /// Вопрос из строки: новый чат на fizmat.ai (форма POST /c — сайт сам отправит вопрос
@@ -83,7 +80,7 @@ fn quick(app: &AppHandle) {
 pub fn quick_ask(text: String, app: AppHandle) -> Result<(), String> {
     let text = text.trim();
     if let Some(q) = app.get_webview_window("quick") {
-        let _ = q.hide();
+        crate::glass::vanish(&q);
     }
     if text.is_empty() {
         return Ok(());
@@ -110,7 +107,7 @@ pub fn quick_ask(text: String, app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn quick_hide(app: AppHandle) {
     if let Some(q) = app.get_webview_window("quick") {
-        let _ = q.hide();
+        crate::glass::vanish(&q);
     }
 }
 
@@ -152,9 +149,18 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     if std::env::var_os("FIZMAT_QUICK").is_some() {
         let later = app.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(4));
-            let again = later.clone();
-            let _ = later.run_on_main_thread(move || quick(&again));
+            // Показать, спрятать и показать снова — второй показ и есть обычный щелчок по трею.
+            for (wait, show) in [(4, true), (2, false), (2, true)] {
+                std::thread::sleep(Duration::from_secs(wait));
+                let again = later.clone();
+                let _ = later.run_on_main_thread(move || {
+                    if show {
+                        quick(&again)
+                    } else if let Some(w) = again.get_webview_window("quick") {
+                        crate::glass::vanish(&w);
+                    }
+                });
+            }
         });
     }
 

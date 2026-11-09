@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 mod code;
+mod glass;
 mod shell;
 mod tray;
 mod update;
