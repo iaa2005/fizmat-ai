@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "fizmat-quick",
+  "description": "Строка быстрого вопроса из трея (dist/quick.html): отправить вопрос новым чатом или спрятаться.",
+  "windows": [
+    "quick"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-quick-ask",
+    "allow-quick-hide"
+  ]
+}

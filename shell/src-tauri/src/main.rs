@@ -13,11 +13,10 @@ use std::time::Duration;
 
 mod code;
 mod shell;
+mod tray;
 mod update;
 
 use serde_json::Value;
-use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const PORT: u16 = 47821;
@@ -46,55 +45,6 @@ const HERE: &str = r#"
     document.readyState === 'loading' ? addEventListener('DOMContentLoaded', go) : go();
 })();
 "#;
-
-fn show(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
-    }
-}
-
-/// Трей: открыть окно, остановить все команды, выйти. Подсказка — привязан ли компьютер
-/// и сколько команд идёт; обновляется раз в три секунды.
-fn tray(app: &AppHandle) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "Открыть Fizmat", true, None::<&str>)?;
-    let stop = MenuItem::with_id(app, "stop", "Остановить все команды", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Выйти из Fizmat", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &stop, &quit])?;
-    let mut builder = TrayIconBuilder::with_id("main")
-        .tooltip("Fizmat")
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, e| match e.id.as_ref() {
-            "open" => show(app),
-            "stop" => shell::stop_all(),
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, e| {
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-                show(tray.app_handle());
-            }
-        });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
-    let icon = builder.build(app)?;
-    let handle = app.clone();
-    std::thread::spawn(move || loop {
-        let n = shell::running();
-        let linked = code::paired(&handle.state::<code::Code>());
-        let text = match (linked, n) {
-            (false, _) => "Fizmat".to_string(),
-            (true, 0) => "Fizmat — Code на связи".to_string(),
-            (true, n) => format!("Fizmat — команд идёт: {n}"),
-        };
-        let _ = icon.set_tooltip(Some(&text));
-        std::thread::sleep(Duration::from_secs(3));
-    });
-    Ok(())
-}
 
 struct Guard {
     token: String,
@@ -230,12 +180,13 @@ fn main() {
         .manage(code::Code::load())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![guard, code::code_status, code::code_pair, code::code_add_root, code::code_remove_root, code::code_ticket])
+        .invoke_handler(tauri::generate_handler![guard, code::code_status, code::code_pair, code::code_add_root, code::code_remove_root, code::code_ticket,
+            tray::quick_ask, tray::quick_hide])
         .setup(|app| {
             // Fizmat Code: компьютер уже привязан — сразу спрашивать вызовы модели.
             code::start(app.handle().clone());
             *app.state::<Guard>().child.lock().unwrap() = start_service(app.path().resource_dir().ok());
-            tray(app.handle())?;
+            tray::build(app.handle())?;
             // Сначала — новая версия, если она есть (ставится сама); потом окно fizmat.ai.
             update::at_start(app.handle().clone(), main_window);
             update::in_background(app.handle().clone(), |app| {

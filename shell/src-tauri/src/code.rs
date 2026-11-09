@@ -184,6 +184,19 @@ pub fn code_ticket(code: State<Code>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Подписка и расход для меню трея (GET /api/code/me); None — не привязан или нет сети.
+pub fn me(code: &Code) -> Option<Value> {
+    let token = code.token()?;
+    ureq::get(&format!("{}/api/code/me", site()))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(10))
+        .call()
+        .ok()?
+        .into_json::<Value>()
+        .ok()
+}
+
 /// Привязан ли компьютер — для трея.
 pub fn paired(code: &Code) -> bool {
     code.token().is_some()
