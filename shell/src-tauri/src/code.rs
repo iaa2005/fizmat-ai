@@ -59,10 +59,24 @@ impl Code {
         Code { cfg: Mutex::new(cfg), polling: AtomicBool::new(false) }
     }
 
+    /// Настройки на диск: сначала во временный файл, потом заменить — оборванная запись не
+    /// портит ключ. Не вышло — причина в code.log (иначе привязка тихо теряется при перезапуске).
     fn save(&self) {
         let cfg = self.cfg.lock().unwrap().clone();
         let _ = fs::create_dir_all(crate::home());
-        let _ = fs::write(file(), serde_json::to_string_pretty(&cfg).unwrap_or_default());
+        let tmp = crate::home().join("code.json.tmp");
+        let done = fs::write(&tmp, serde_json::to_string_pretty(&cfg).unwrap_or_default()).and_then(|_| fs::rename(&tmp, file()));
+        if let Err(e) = done {
+            journal("-", "config", "code.json", &format!("not saved: {e}"));
+        }
+    }
+
+    /// Ключ в памяти есть, а на диске его нет — дописать (после сбоя записи).
+    fn heal(&self) {
+        let on_disk: Option<Config> = fs::read_to_string(file()).ok().and_then(|s| serde_json::from_str(&s).ok());
+        if on_disk.and_then(|c| c.token) != self.token() {
+            self.save();
+        }
     }
 
     fn token(&self) -> Option<String> {
@@ -79,7 +93,10 @@ impl Code {
             .timeout(Duration::from_secs(15))
             .send_json(json!({ "version": VERSION, "platform": std::env::consts::OS, "shell": crate::shell::detect().name, "roots": roots }));
         match res {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.heal();
+                Ok(())
+            }
             Err(ureq::Error::Status(401, _)) => {
                 self.unpair();
                 Err("компьютер отвязан на сайте".into())
@@ -782,6 +799,21 @@ mod tests {
         fs::create_dir_all(d.join("dist")).unwrap();
         fs::write(d.join("dist/x.js"), "TODO").unwrap();
         d
+    }
+
+    #[test]
+    fn the_key_reaches_the_disk_and_heals_when_missing() {
+        let d = tmp();
+        std::env::set_var("APPDATA", &d);
+        let code = Code::load();
+        code.cfg.lock().unwrap().token = Some("fzd_test".into());
+        code.heal();
+        assert_eq!(Code::load().token().as_deref(), Some("fzd_test"));
+        assert!(!crate::home().join("code.json.tmp").exists());
+        // Файл потерял ключ (сбой записи) — следующий «привет» сайту дописывает его.
+        fs::write(crate::home().join("code.json"), r#"{"device_id":null,"token":null,"roots":[]}"#).unwrap();
+        code.heal();
+        assert_eq!(Code::load().token().as_deref(), Some("fzd_test"));
     }
 
     #[test]
