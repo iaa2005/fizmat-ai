@@ -1,6 +1,6 @@
 [package]
 name = "fizmat-guard"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fizmat с защитой личных данных на устройстве"
 edition = "2021"
 
@@ -16,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 tauri-plugin-dialog = "2"
 ignore = "0.4"
 regex = "1"
+similar = "2"
 
 [profile.release]
 strip = true

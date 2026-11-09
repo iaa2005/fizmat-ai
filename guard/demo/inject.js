@@ -85,6 +85,8 @@ ${items ? `<ul>${items}</ul>` : ''}
     /** Текст вопроса → что отправить на самом деле, или null — отмена. */
     async function gate(text) {
         if (!text || !text.trim() || !state.enabled) return text;
+        // Чат Code (папка на компьютере): прослойка только для облачных чатов.
+        if (document.querySelector('[data-no-guard]')) return text;
         if (state.phase === 'download' || state.phase === 'loading') {
             const why = state.phase === 'download'
                 ? `модель ещё скачивается (${Math.round(state.progress * 100)}%)` : 'модель ещё загружается';
