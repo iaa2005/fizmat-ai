@@ -43,8 +43,19 @@ fn quick(app: &AppHandle) {
             };
             let hide = w.clone();
             w.on_window_event(move |e| {
+                if std::env::var_os("FIZMAT_QUICK").is_some() {
+                    code::note("quick", &format!("{e:?}"));
+                }
+                // Фокус уходит во вложенный WebView2 — окну приходит ложное «потерян фокус»;
+                // прятать, только если и чуть позже фокус не у этого окна (щёлкнули мимо).
                 if let WindowEvent::Focused(false) = e {
-                    let _ = hide.hide();
+                    let hide = hide.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(150));
+                        if !hide.is_focused().unwrap_or(false) {
+                            let _ = hide.hide();
+                        }
+                    });
                 }
             });
             w
@@ -56,6 +67,9 @@ fn quick(app: &AppHandle) {
         let x = at.x + (area.width as i32 - size.width as i32) / 2;
         let y = at.y + area.height as i32 / 4;
         let _ = window.set_position(PhysicalPosition::new(x, y));
+    }
+    if std::env::var_os("FIZMAT_QUICK").is_some() {
+        code::note("quick", &format!("show at {:?} size {:?}", window.outer_position(), window.outer_size()));
     }
     let _ = window.show();
     let _ = window.set_focus();
@@ -134,6 +148,15 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         builder = builder.icon(icon.clone());
     }
     let icon = builder.build(app)?;
+    // Проверка вида строки без щелчка по трею.
+    if std::env::var_os("FIZMAT_QUICK").is_some() {
+        let later = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(4));
+            let again = later.clone();
+            let _ = later.run_on_main_thread(move || quick(&again));
+        });
+    }
 
     // Подсказка и «Остановить команды» — раз в три секунды; подписка и расход — раз в минуту.
     let handle = app.clone();
