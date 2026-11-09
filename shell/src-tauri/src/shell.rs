@@ -75,14 +75,44 @@ impl Output {
     }
 
     fn text(&self) -> String {
-        let mut s = String::from_utf8_lossy(&self.head).to_string();
+        let mut s = decode(&self.head);
         if self.dropped > 0 {
             s.push_str(&format!("\n… [{} bytes of output omitted] …\n", self.dropped));
         }
         let tail: Vec<u8> = self.tail.iter().copied().collect();
-        s.push_str(&String::from_utf8_lossy(&tail));
+        s.push_str(&decode(&tail));
         s
     }
+}
+
+/// Вывод в UTF-8 — как есть; иначе это кодировка Windows (cp1251 у Python и
+/// многих программ в трубу). Обрезка головы и хвоста может разрезать один
+/// символ UTF-8 — пара битых байтов на краях ещё не повод менять кодировку.
+fn decode(bytes: &[u8]) -> String {
+    let bad: usize = bytes.utf8_chunks().map(|c| c.invalid().len()).sum();
+    if bad <= 4 {
+        return String::from_utf8_lossy(bytes).to_string();
+    }
+    ansi(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string())
+}
+
+#[cfg(windows)]
+fn ansi(bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+    let len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: буферы живые, длины переданы точно.
+    let n = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; n as usize];
+    let n = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n) };
+    (n > 0).then(|| String::from_utf16_lossy(&wide[..n as usize]))
+}
+
+#[cfg(not(windows))]
+fn ansi(_: &[u8]) -> Option<String> {
+    None
 }
 
 fn pump(mut from: impl Read + Send + 'static, out: Arc<Mutex<Output>>) -> std::thread::JoinHandle<()> {
@@ -110,6 +140,8 @@ pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool) -> 
     cmd.current_dir(dir)
         .env("GIT_PAGER", "cat").env("PAGER", "cat").env("NO_COLOR", "1").env("TERM", "dumb")
         .env("GIT_TERMINAL_PROMPT", "0").env("CHERE_INVOKING", "1")
+        // Python в трубу пишет кодировкой Windows — пусть пишет UTF-8, как в терминале.
+        .env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1")
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
@@ -236,6 +268,19 @@ mod tests {
         o.push(&vec![b'a'; HEAD + TAIL + 100]);
         let t = o.text();
         assert!(t.contains("100 bytes of output omitted"));
+    }
+
+    #[test]
+    fn output_in_the_windows_code_page_is_read_right() {
+        // «Привет, мир» в cp1251 и в UTF-8.
+        let cp1251 = [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, 0x2C, 0x20, 0xEC, 0xE8, 0xF0];
+        if cfg!(windows) && unsafe { windows_sys::Win32::Globalization::GetACP() } == 1251 {
+            assert_eq!(decode(&cp1251), "Привет, мир");
+        }
+        assert_eq!(decode("Привет, мир".as_bytes()), "Привет, мир");
+        // Обрезанный с краю символ UTF-8 не переводит весь вывод в cp1251.
+        let cut = &"Привет".as_bytes()[1..];
+        assert_eq!(decode(cut), "\u{FFFD}ривет");
     }
 
     #[test]
