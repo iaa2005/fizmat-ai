@@ -47,6 +47,8 @@ pub struct Config {
 pub struct Code {
     pub cfg: Mutex<Config>,
     polling: AtomicBool,
+    /// Первый привет после запуска: сайт закроет фоновые команды прошлого запуска.
+    fresh: AtomicBool,
 }
 
 fn file() -> PathBuf {
@@ -56,7 +58,7 @@ fn file() -> PathBuf {
 impl Code {
     pub fn load() -> Self {
         let cfg = fs::read_to_string(file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        Code { cfg: Mutex::new(cfg), polling: AtomicBool::new(false) }
+        Code { cfg: Mutex::new(cfg), polling: AtomicBool::new(false), fresh: AtomicBool::new(true) }
     }
 
     /// Настройки на диск: сначала во временный файл, потом заменить — оборванная запись не
@@ -91,7 +93,8 @@ impl Code {
             .set("Authorization", &format!("Bearer {token}"))
             .set("Accept", "application/json")
             .timeout(Duration::from_secs(15))
-            .send_json(json!({ "version": VERSION, "platform": std::env::consts::OS, "shell": crate::shell::detect().name, "roots": roots }));
+            .send_json(json!({ "version": VERSION, "platform": std::env::consts::OS, "shell": crate::shell::detect().name, "roots": roots,
+                "started": self.fresh.swap(false, Ordering::SeqCst) }));
         match res {
             Ok(_) => {
                 self.heal();
@@ -166,6 +169,26 @@ pub async fn code_add_root(app: AppHandle, code: State<'_, Code>) -> Result<Opti
     Ok(Some(status(&code)))
 }
 
+/// Билет на минуту для страницы fizmat.ai в этом окне: по нему сайт узнаёт, что чат открыт
+/// в программе на этом компьютере (Remote Control). Ключ устройства странице не отдаётся.
+#[tauri::command]
+pub fn code_ticket(code: State<Code>) -> Result<Value, String> {
+    let Some(token) = code.token() else { return Err("компьютер не привязан".into()) };
+    ureq::post(&format!("{}/api/code/here", site()))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(10))
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_json::<Value>()
+        .map_err(|e| e.to_string())
+}
+
+/// Привязан ли компьютер — для трея.
+pub fn paired(code: &Code) -> bool {
+    code.token().is_some()
+}
+
 #[tauri::command]
 pub fn code_remove_root(path: String, code: State<Code>) -> Result<Value, String> {
     code.cfg.lock().unwrap().roots.retain(|r| r.path != path);
@@ -207,6 +230,12 @@ pub fn start(app: AppHandle) {
                     }
                     for call in calls {
                         let id = call["id"].as_i64().unwrap_or(0);
+                        // Команда в фоне: ответ «запущена» сразу, итог — отдельно (POST /api/code/jobs/{id}).
+                        if call["tool"].as_str() == Some("bash") && call["args"]["job"].as_i64().is_some() {
+                            let (app, token) = (app.clone(), token.clone());
+                            std::thread::spawn(move || background(&app, &token, &call));
+                            continue;
+                        }
                         // Команда может идти минутами — своим потоком, чтобы чтение и правка не ждали её.
                         if call["tool"].as_str() == Some("bash") {
                             let (app, token) = (app.clone(), token.clone());
@@ -228,6 +257,76 @@ pub fn start(app: AppHandle) {
             std::thread::sleep(Duration::from_secs(pause));
         }
     });
+}
+
+/// Фоновая команда: проверить папку, ответить на вызов, вести команду до конца и
+/// раз в пять секунд приносить сайту хвост вывода (он же знак «программа жива»).
+fn background(app: &AppHandle, token: &str, call: &Value) {
+    let code = app.state::<Code>();
+    let id = call["id"].as_i64().unwrap_or(0);
+    let job = call["args"]["job"].as_i64().unwrap_or(0);
+    let root = call["root"].as_str().unwrap_or("");
+    let args = &call["args"];
+    if !code.cfg.lock().unwrap().roots.iter().any(|r| r.path == root) {
+        return post(token, id, fail("this folder is not open in the Fizmat app on the computer"));
+    }
+    let dir = match inside(root, args["cwd"].as_str().unwrap_or(".")) {
+        Ok((_, d)) if d.is_dir() => d,
+        Ok(_) => return post(token, id, fail("cwd is not a directory")),
+        Err(e) => return post(token, id, fail(e)),
+    };
+    let command = args["command"].as_str().unwrap_or("").trim().to_string();
+    if command.is_empty() {
+        return post(token, id, fail("command is empty"));
+    }
+    post(token, id, json!({ "ok": true, "text": format!("Started job #{job}") }));
+    journal(root, "job", &command.replace(['\n', '\t'], " "), "запущена");
+
+    let checks = std::cell::Cell::new(0u32);
+    // «Стоп» у задачи на сайте — раз в три секунды, чаще незачем.
+    let stop = || {
+        checks.set(checks.get() + 1);
+        checks.get() % 3 == 0 && job_stopped(token, job)
+    };
+    let tick = |out: &str| report(token, job, json!({ "output": out }));
+    let timeout = args["timeout"].as_u64().unwrap_or(1800);
+    let done = match crate::shell::run(&dir, &command, timeout, &stop, &tick) {
+        Ok(r) => json!({ "done": true, "output": r["text"], "exit": r["meta"]["exit"], "killed": r["meta"]["why"] }),
+        Err(e) => json!({ "done": true, "output": e, "exit": -1 }),
+    };
+    journal(root, "job", &command.replace(['\n', '\t'], " "), &format!("exit {}", done["exit"]));
+    // Итог важен: сеть моргнула — ещё пару попыток.
+    for _ in 0..3 {
+        if report_ok(token, job, &done) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn report(token: &str, job: i64, body: Value) {
+    report_ok(token, job, &body);
+}
+
+fn report_ok(token: &str, job: i64, body: &Value) -> bool {
+    ureq::post(&format!("{}/api/code/jobs/{job}", site()))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(20))
+        .send_json(body.clone())
+        .is_ok()
+}
+
+fn job_stopped(token: &str, job: i64) -> bool {
+    ureq::get(&format!("{}/api/code/jobs/{job}", site()))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(5))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Value>().ok())
+        .map(|v| v["stop"].as_bool().unwrap_or(false))
+        .unwrap_or(false)
 }
 
 fn post(token: &str, id: i64, answer: Value) {
@@ -679,6 +778,11 @@ fn allowed(app: &AppHandle, args: &Value, title: &str, rel: &str, diff: &str) ->
 }
 
 /// Журнал правок на компьютере (%APPDATA%/FizmatGuard/code.log): что, где, разрешено ли.
+/// Строка в code.log не про вызов модели (обновление программы и т. п.).
+pub fn note(what: &str, text: &str) {
+    journal("-", what, "", text);
+}
+
 fn journal(root: &str, what: &str, rel: &str, verdict: &str) {
     use std::io::Write;
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -744,7 +848,7 @@ fn bash(root: &str, args: &Value, stop: &dyn Fn() -> bool) -> Result<Value, Stri
     if command.is_empty() {
         return Err("command is empty".into());
     }
-    let r = crate::shell::run(&dir, command, args["timeout"].as_u64().unwrap_or(60), stop)?;
+    let r = crate::shell::run(&dir, command, args["timeout"].as_u64().unwrap_or(60).min(300), stop, &|_| {})?;
     journal(root, "bash", &command.replace(['\n', '\t'], " "), &format!("exit {}", r["meta"]["exit"]));
     Ok(r)
 }

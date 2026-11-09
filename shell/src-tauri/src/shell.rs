@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,37 @@ use serde_json::{json, Value};
 
 const HEAD: usize = 12 * 1024;
 const TAIL: usize = 36 * 1024;
+
+/// Потолок таймаута: фоновая команда — до шести часов.
+pub const MAX_SECS: u64 = 6 * 3600;
+
+/// «Остановить все команды» в трее: каждая команда помнит номер на старте и умирает, когда он сменился.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+pub fn stop_all() {
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Сколько команд идёт сейчас — для подсказки в трее.
+pub fn running() -> usize {
+    RUNNING.load(Ordering::SeqCst)
+}
+
+struct Counted;
+
+impl Counted {
+    fn new() -> Self {
+        RUNNING.fetch_add(1, Ordering::SeqCst);
+        Counted
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        RUNNING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Clone)]
 pub struct Shell {
@@ -128,8 +160,11 @@ fn pump(mut from: impl Read + Send + 'static, out: Arc<Mutex<Output>>) -> std::t
 }
 
 /// Выполнить команду в папке `dir`. `stop` спрашивается раз в секунду: «Стоп» в чате.
-pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool) -> Result<Value, String> {
+/// `tick` раз в пять секунд получает вывод на этот момент (фоновая команда несёт его сайту).
+pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool, tick: &dyn Fn(&str)) -> Result<Value, String> {
     let shell = detect();
+    let _counted = Counted::new();
+    let generation = GENERATION.load(Ordering::SeqCst);
     let mut cmd = Command::new(&shell.exe);
     if shell.name == "powershell" {
         let utf8 = "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; ";
@@ -155,8 +190,9 @@ pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool) -> 
     let out = Arc::new(Mutex::new(Output::default()));
     let readers = [pump(child.stdout.take().unwrap(), out.clone()), pump(child.stderr.take().unwrap(), out.clone())];
 
-    let limit = Duration::from_secs(timeout.clamp(1, 300));
+    let limit = Duration::from_secs(timeout.clamp(1, MAX_SECS));
     let mut last_check = Instant::now();
+    let mut last_tick = Instant::now();
     let mut killed: Option<&str> = None;
     let status = loop {
         if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
@@ -164,6 +200,8 @@ pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool) -> 
         }
         if started.elapsed() >= limit {
             killed = Some("timeout");
+        } else if GENERATION.load(Ordering::SeqCst) != generation {
+            killed = Some("stopped");
         } else if last_check.elapsed() >= Duration::from_secs(1) {
             last_check = Instant::now();
             if stop() {
@@ -174,6 +212,11 @@ pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool) -> 
             job.kill();
             let _ = child.kill();
             break child.wait().ok();
+        }
+        if last_tick.elapsed() >= Duration::from_secs(5) {
+            last_tick = Instant::now();
+            let now = out.lock().unwrap().text();
+            tick(&now);
         }
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -192,7 +235,7 @@ pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool) -> 
         None => {}
     }
     Ok(json!({ "ok": true, "text": text.trim_start_matches('\n'),
-        "meta": { "exit": code, "killed": killed.is_some(), "seconds": started.elapsed().as_secs() } }))
+        "meta": { "exit": code, "killed": killed.is_some(), "why": killed, "seconds": started.elapsed().as_secs() } }))
 }
 
 #[cfg(windows)]
@@ -253,14 +296,22 @@ mod tree {
 mod tests {
     use super::*;
 
+    // «Остановить всё» убивает и команды соседних тестов — команды тестов идут по одной.
+    static ONE: Mutex<()> = Mutex::new(());
+
+    fn one() -> std::sync::MutexGuard<'static, ()> {
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn runs_reports_exit_codes_and_keeps_head_and_tail() {
+        let _one = one();
         let dir = std::env::temp_dir();
-        let ok = run(&dir, "echo hello", 20, &|| false).unwrap();
+        let ok = run(&dir, "echo hello", 20, &|| false, &|_| {}).unwrap();
         assert!(ok["text"].as_str().unwrap().contains("hello"));
         assert_eq!(ok["meta"]["exit"], 0);
 
-        let bad = run(&dir, "exit 3", 20, &|| false).unwrap();
+        let bad = run(&dir, "exit 3", 20, &|| false, &|_| {}).unwrap();
         assert_eq!(bad["meta"]["exit"], 3);
         assert!(bad["text"].as_str().unwrap().contains("exit code: 3"));
 
@@ -284,18 +335,38 @@ mod tests {
     }
 
     #[test]
+    fn stop_all_kills_running_commands_and_ticks_bring_output() {
+        let _one = one();
+        let dir = std::env::temp_dir();
+        let long = if detect().name == "powershell" { "echo first; Start-Sleep 30" } else { "echo first; sleep 30" };
+        let seen = Mutex::new(Vec::<String>::new());
+        let h = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(7));
+            stop_all();
+        });
+        let t0 = Instant::now();
+        let r = run(&dir, long, 60, &|| false, &|o| seen.lock().unwrap().push(o.to_string())).unwrap();
+        h.join().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(12), "{:?}", t0.elapsed());
+        assert_eq!(r["meta"]["why"], "stopped");
+        assert!(seen.lock().unwrap().iter().any(|o| o.contains("first")));
+        assert_eq!(running(), 0);
+    }
+
+    #[test]
     fn stop_kills_a_long_command() {
+        let _one = one();
         let dir = std::env::temp_dir();
         let long = if detect().name == "powershell" { "Start-Sleep 30" } else { "sleep 30" };
         let t = Instant::now();
-        let r = run(&dir, long, 60, &|| true).unwrap();
+        let r = run(&dir, long, 60, &|| true, &|_| {}).unwrap();
         assert!(t.elapsed() < Duration::from_secs(10));
         assert_eq!(r["meta"]["killed"], true);
 
         // Фоновый потомок держит вывод открытым — Job Object убивает его вместе с командой.
         if detect().name == "bash" {
             let t = Instant::now();
-            let r = run(&dir, "sleep 40 & echo started", 60, &|| false).unwrap();
+            let r = run(&dir, "sleep 40 & echo started", 60, &|| false, &|_| {}).unwrap();
             assert!(t.elapsed() < Duration::from_secs(10), "команда не должна ждать фонового потомка");
             assert!(r["text"].as_str().unwrap().contains("started"));
         }

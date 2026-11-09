@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fizmat</title>
+<!-- Окно при запуске, пока ставится новая версия программы (src-tauri/src/update.rs). -->
+<style>
+    html, body { margin: 0; height: 100%; font: 15px/1.5 "Segoe UI", system-ui, sans-serif; background: #faf9f5; color: #1f1e1d; }
+    @media (prefers-color-scheme: dark) { html, body { background: #1f1e1d; color: #f5f4ef; } }
+    body { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 14px; }
+    .bar { width: 220px; height: 4px; border-radius: 2px; background: rgba(127, 127, 127, .25); overflow: hidden; }
+    .bar i { display: block; width: 40%; height: 100%; background: currentColor; border-radius: 2px; animation: go 1.2s ease-in-out infinite; }
+    @keyframes go { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+</style>
+<body>
+    <div>Обновляю Fizmat…</div>
+    <div class="bar"><i></i></div>
+</body>

@@ -13,13 +13,88 @@ use std::time::Duration;
 
 mod code;
 mod shell;
+mod update;
 
 use serde_json::Value;
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const PORT: u16 = 47821;
 const START_URL: &str = "https://fizmat.ai/home";
 const INJECT: &str = include_str!("../../../guard/inject.js");
+
+/// Страница fizmat.ai в этом окне говорит сайту «я в программе на этом компьютере» (Remote
+/// Control у чатов Code): билет программы → POST /code/here. Раз на сессию сайта — ключом
+/// служит её csrf-токен (он меняется со входом и выходом).
+const HERE: &str = r#"
+(() => {
+    if (window.top !== window) return;
+    const go = async () => {
+        const invoke = window.__TAURI__?.core?.invoke;
+        const csrf = document.querySelector('meta[name=csrf-token]')?.content;
+        if (!invoke || !csrf || sessionStorage.getItem('fz-here') === csrf) return;
+        try {
+            const { ticket } = await invoke('code_ticket');
+            const r = await fetch('/code/here', { method: 'POST', credentials: 'same-origin', body: JSON.stringify({ ticket }),
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-CSRF-TOKEN': csrf } });
+            if (!r.ok) return;
+            sessionStorage.setItem('fz-here', csrf);
+            if ((await r.json()).changed) window.ChatSidebar?.refresh?.();
+        } catch (e) { /* не привязан или старая программа */ }
+    };
+    document.readyState === 'loading' ? addEventListener('DOMContentLoaded', go) : go();
+})();
+"#;
+
+fn show(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// Трей: открыть окно, остановить все команды, выйти. Подсказка — привязан ли компьютер
+/// и сколько команд идёт; обновляется раз в три секунды.
+fn tray(app: &AppHandle) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "open", "Открыть Fizmat", true, None::<&str>)?;
+    let stop = MenuItem::with_id(app, "stop", "Остановить все команды", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Выйти из Fizmat", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &stop, &quit])?;
+    let mut builder = TrayIconBuilder::with_id("main")
+        .tooltip("Fizmat")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, e| match e.id.as_ref() {
+            "open" => show(app),
+            "stop" => shell::stop_all(),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, e| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+                show(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    let icon = builder.build(app)?;
+    let handle = app.clone();
+    std::thread::spawn(move || loop {
+        let n = shell::running();
+        let linked = code::paired(&handle.state::<code::Code>());
+        let text = match (linked, n) {
+            (false, _) => "Fizmat".to_string(),
+            (true, 0) => "Fizmat — Code на связи".to_string(),
+            (true, n) => format!("Fizmat — команд идёт: {n}"),
+        };
+        let _ = icon.set_tooltip(Some(&text));
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    Ok(())
+}
 
 struct Guard {
     token: String,
@@ -122,23 +197,50 @@ fn guard(path: String, body: Option<Value>, state: tauri::State<Guard>) -> Resul
     }
 }
 
+/// Окно fizmat.ai. Крестик прячет его в трей: Code ждёт вызовы модели и с закрытым окном.
+fn main_window(app: &AppHandle) {
+    let script = format!("window.__FZ_GUARD = {{ ipc: true }};\n{INJECT}\n{HERE}");
+    let built = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(START_URL.parse().unwrap()))
+        .title("Fizmat")
+        .inner_size(1280.0, 860.0)
+        .min_inner_size(420.0, 560.0)
+        .initialization_script(&script)
+        .build();
+    let Ok(window) = built else { return };
+    let hidden = window.clone();
+    window.on_window_event(move |e| {
+        if let WindowEvent::CloseRequested { api, .. } = e {
+            api.prevent_close();
+            let _ = hidden.hide();
+        }
+    });
+}
+
+/// Перед установкой новой версии: прослойка и команды не должны держать файлы программы.
+pub(crate) fn before_update(app: &AppHandle) {
+    shell::stop_all();
+    if let Some(mut child) = app.state::<Guard>().child.lock().unwrap().take() {
+        let _ = child.kill();
+    }
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .manage(Guard { token: token(), child: Mutex::new(None) })
         .manage(code::Code::load())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![guard, code::code_status, code::code_pair, code::code_add_root, code::code_remove_root])
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![guard, code::code_status, code::code_pair, code::code_add_root, code::code_remove_root, code::code_ticket])
         .setup(|app| {
             // Fizmat Code: компьютер уже привязан — сразу спрашивать вызовы модели.
             code::start(app.handle().clone());
             *app.state::<Guard>().child.lock().unwrap() = start_service(app.path().resource_dir().ok());
-            let script = format!("window.__FZ_GUARD = {{ ipc: true }};\n{INJECT}");
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(START_URL.parse().unwrap()))
-                .title("Fizmat")
-                .inner_size(1280.0, 860.0)
-                .min_inner_size(420.0, 560.0)
-                .initialization_script(&script)
-                .build()?;
+            tray(app.handle())?;
+            // Сначала — новая версия, если она есть (ставится сама); потом окно fizmat.ai.
+            update::at_start(app.handle().clone(), main_window);
+            update::in_background(app.handle().clone(), |app| {
+                shell::running() == 0 && !app.get_webview_window("main").and_then(|w| w.is_visible().ok()).unwrap_or(false)
+            });
             Ok(())
         })
         .build(tauri::generate_context!())

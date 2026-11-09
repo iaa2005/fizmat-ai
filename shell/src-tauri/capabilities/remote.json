@@ -17,6 +17,7 @@
     "allow-code-status",
     "allow-code-pair",
     "allow-code-add-root",
-    "allow-code-remove-root"
+    "allow-code-remove-root",
+    "allow-code-ticket"
   ]
 }

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Fizmat",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "identifier": "ai.fizmat.guard",
   "build": {
     "frontendDist": "../dist"
@@ -13,8 +13,16 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENGNDk0RUI0QkU0MjZGNTkKUldSWmIwSyt0RTVKejkxdjlNWVNsY0Y4QldHOERBeTRwM3lobVgyT0tUQ2xuSzB4STUvS09EQy8K",
+      "endpoints": ["https://github.com/iaa2005/fizmat-ai/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": [
       "nsis"
     ],
