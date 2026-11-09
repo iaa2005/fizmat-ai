@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-code-add-root"
+description = "Enables the code_add_root command without any pre-configured scope."
+commands.allow = ["code_add_root"]
+
+[[permission]]
+identifier = "deny-code-add-root"
+description = "Denies the code_add_root command without any pre-configured scope."
+commands.deny = ["code_add_root"]

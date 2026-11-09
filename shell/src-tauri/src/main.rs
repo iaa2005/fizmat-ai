@@ -11,6 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod code;
+
 use serde_json::Value;
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
@@ -23,7 +25,7 @@ struct Guard {
     child: Mutex<Option<Child>>,
 }
 
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     base.join("FizmatGuard")
 }
@@ -122,8 +124,12 @@ fn guard(path: String, body: Option<Value>, state: tauri::State<Guard>) -> Resul
 fn main() {
     let app = tauri::Builder::default()
         .manage(Guard { token: token(), child: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![guard])
+        .manage(code::Code::load())
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![guard, code::code_status, code::code_pair, code::code_add_root, code::code_remove_root])
         .setup(|app| {
+            // Fizmat Code: компьютер уже привязан — сразу спрашивать вызовы модели.
+            code::start(app.handle().clone());
             *app.state::<Guard>().child.lock().unwrap() = start_service(app.path().resource_dir().ok());
             let script = format!("window.__FZ_GUARD = {{ ipc: true }};\n{INJECT}");
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(START_URL.parse().unwrap()))

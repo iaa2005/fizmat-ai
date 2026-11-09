@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-code-status"
+description = "Enables the code_status command without any pre-configured scope."
+commands.allow = ["code_status"]
+
+[[permission]]
+identifier = "deny-code-status"
+description = "Denies the code_status command without any pre-configured scope."
+commands.deny = ["code_status"]

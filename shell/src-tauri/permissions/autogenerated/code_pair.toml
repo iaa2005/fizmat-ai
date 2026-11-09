@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-code-pair"
+description = "Enables the code_pair command without any pre-configured scope."
+commands.allow = ["code_pair"]
+
+[[permission]]
+identifier = "deny-code-pair"
+description = "Denies the code_pair command without any pre-configured scope."
+commands.deny = ["code_pair"]

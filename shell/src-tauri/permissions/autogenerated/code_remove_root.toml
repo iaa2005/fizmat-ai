@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-code-remove-root"
+description = "Enables the code_remove_root command without any pre-configured scope."
+commands.allow = ["code_remove_root"]
+
+[[permission]]
+identifier = "deny-code-remove-root"
+description = "Denies the code_remove_root command without any pre-configured scope."
+commands.deny = ["code_remove_root"]
