@@ -1,6 +1,6 @@
 // Fizmat Code на компьютере: привязка к аккаунту, папки, которые человек выбрал
-// в окне программы, и исполнение вызовов модели (дерево, чтение, поиск, правка;
-// правку по режиму чата программа спрашивает своим окном).
+// в окне программы, и исполнение вызовов модели (дерево, чтение, поиск, правка,
+// команды оболочки — shell.rs). Разрешения спрашивает чат на сайте.
 //
 // Программа сама спрашивает у fizmat.ai вызовы (GET /api/code/calls) ключом
 // устройства и приносит ответы. Всё исполняется только внутри выбранных папок:
@@ -77,7 +77,7 @@ impl Code {
             .set("Authorization", &format!("Bearer {token}"))
             .set("Accept", "application/json")
             .timeout(Duration::from_secs(15))
-            .send_json(json!({ "version": VERSION, "platform": std::env::consts::OS, "roots": roots }));
+            .send_json(json!({ "version": VERSION, "platform": std::env::consts::OS, "shell": crate::shell::detect().name, "roots": roots }));
         match res {
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(401, _)) => {
@@ -189,13 +189,19 @@ pub fn start(app: AppHandle) {
                         last_call = Instant::now();
                     }
                     for call in calls {
-                        let answer = execute(&app, &code, &call);
                         let id = call["id"].as_i64().unwrap_or(0);
-                        let _ = ureq::post(&format!("{}/api/code/calls/{id}", site()))
-                            .set("Authorization", &format!("Bearer {token}"))
-                            .set("Accept", "application/json")
-                            .timeout(Duration::from_secs(30))
-                            .send_json(answer);
+                        // Команда может идти минутами — своим потоком, чтобы чтение и правка не ждали её.
+                        if call["tool"].as_str() == Some("bash") {
+                            let (app, token) = (app.clone(), token.clone());
+                            std::thread::spawn(move || {
+                                let code = app.state::<Code>();
+                                let answer = execute(&app, &code, &call, &|| stopped(&token, id));
+                                post(&token, id, answer);
+                            });
+                            continue;
+                        }
+                        let answer = execute(&app, &code, &call, &|| false);
+                        post(&token, id, answer);
                     }
                 }
                 Err(ureq::Error::Status(401, _)) => code.unpair(),
@@ -205,6 +211,27 @@ pub fn start(app: AppHandle) {
             std::thread::sleep(Duration::from_secs(pause));
         }
     });
+}
+
+fn post(token: &str, id: i64, answer: Value) {
+    let _ = ureq::post(&format!("{}/api/code/calls/{id}", site()))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(30))
+        .send_json(answer);
+}
+
+/// Ход остановили («Стоп» в чате) или он перестал ждать — команду пора убить.
+fn stopped(token: &str, id: i64) -> bool {
+    ureq::get(&format!("{}/api/code/calls/{id}", site()))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(5))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Value>().ok())
+        .map(|v| v["stop"].as_bool().unwrap_or(false))
+        .unwrap_or(false)
 }
 
 // ── Исполнение ───────────────────────────────────────────────────────────
@@ -220,7 +247,7 @@ fn fail(msg: impl Into<String>) -> Value {
     json!({ "ok": false, "error": msg.into() })
 }
 
-fn execute(app: &AppHandle, code: &Code, call: &Value) -> Value {
+fn execute(app: &AppHandle, code: &Code, call: &Value, stop: &dyn Fn() -> bool) -> Value {
     let root = call["root"].as_str().unwrap_or("");
     // Корень — только из своих папок: сайт не может назвать чужую.
     if !code.cfg.lock().unwrap().roots.iter().any(|r| r.path == root) {
@@ -234,6 +261,7 @@ fn execute(app: &AppHandle, code: &Code, call: &Value) -> Value {
         "grep" | "search" => grep(root, args),
         "edit" => edit(app, root, args),
         "write" => write(app, root, args),
+        "bash" => bash(root, args, stop),
         other => Err(format!("unknown tool: {other}")),
     };
     result.unwrap_or_else(fail)
@@ -687,6 +715,21 @@ fn edit(app: &AppHandle, root: &str, args: &Value) -> Result<Value, String> {
     let many = if count > 1 { format!(", {count} replacements") } else { String::new() };
     Ok(json!({ "ok": true, "text": format!("Edited {rel}: +{added} −{removed}{many}"),
         "meta": { "diff": d, "added": added, "removed": removed } }))
+}
+
+/// Команда в папке (или её подпапке `cwd`); что выполнялось и чем кончилось — в журнал.
+fn bash(root: &str, args: &Value, stop: &dyn Fn() -> bool) -> Result<Value, String> {
+    let (_, dir) = inside(root, args["cwd"].as_str().unwrap_or("."))?;
+    if !dir.is_dir() {
+        return Err("cwd is not a directory".into());
+    }
+    let command = args["command"].as_str().unwrap_or("").trim();
+    if command.is_empty() {
+        return Err("command is empty".into());
+    }
+    let r = crate::shell::run(&dir, command, args["timeout"].as_u64().unwrap_or(60), stop)?;
+    journal(root, "bash", &command.replace(['\n', '\t'], " "), &format!("exit {}", r["meta"]["exit"]));
+    Ok(r)
 }
 
 fn write(app: &AppHandle, root: &str, args: &Value) -> Result<Value, String> {

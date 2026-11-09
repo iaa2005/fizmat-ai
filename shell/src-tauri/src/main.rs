@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 mod code;
+mod shell;
 
 use serde_json::Value;
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
