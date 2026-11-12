@@ -17,6 +17,8 @@ mod computer;
 mod glass;
 mod shell;
 mod tray;
+#[cfg(windows)]
+mod ui;
 mod update;
 #[cfg(windows)]
 mod veil;

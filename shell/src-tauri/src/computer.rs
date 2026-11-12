@@ -183,8 +183,35 @@ fn picture(x: i32, y: i32, w: i32, h: i32, scale: f64, note: String) -> Out {
         "width": nw, "height": nh } }))
 }
 
+/// Что сказать модели, когда Windows на экране блокировки.
+const LOCKED: &str = "THE COMPUTER IS LOCKED (Windows lock screen): screenshots show only the lock screen and clicks, typing and the clipboard do not reach applications. Tell the person to unlock it (you never enter PINs or passwords) and stop — do not look for workarounds";
+
+/// Экран блокировки: ввод уходит на защищённый рабочий стол или впереди LockApp.
+pub fn locked() -> bool {
+    use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS, UOI_NAME};
+    unsafe {
+        let d = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+        if d.is_null() {
+            return true;
+        }
+        let mut buf = [0u16; 64];
+        let mut need = 0u32;
+        let got = GetUserObjectInformationW(d as _, UOI_NAME, buf.as_mut_ptr() as _, (buf.len() * 2) as u32, &mut need);
+        CloseDesktop(d);
+        let name = String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(0)]);
+        if got != 0 && !name.eq_ignore_ascii_case("default") {
+            return true;
+        }
+    }
+    front().map(|(_, app, _)| app == "lockapp" || app == "logonui").unwrap_or(false)
+}
+
 fn screenshot() -> Out {
     let v = view()?;
+    if locked() {
+        // Снимок экрана блокировки модели ничего не даст (а часто и не снимается вовсе).
+        return ok(LOCKED);
+    }
     let cursor = cursor().map(|(x, y)| format!(" The mouse is at ({x}, {y}).")).unwrap_or_default();
     let front = front().map(|(_, name, title)| format!(" Frontmost: {name} — «{title}».")).unwrap_or_default();
     let (nw, nh) = ((v.w as f64 / v.scale).round() as i32, (v.h as f64 / v.scale).round() as i32);
@@ -538,7 +565,7 @@ fn clipboard_write(args: &Value) -> Out {
 
 // ── Приложения ───────────────────────────────────────────────────────────
 
-fn list_windows() -> Out {
+fn list_windows(args: &Value) -> Out {
     let me = unsafe { GetCurrentProcessId() };
     let mut seen: Vec<String> = Vec::new();
     let mut lines = Vec::new();
@@ -547,7 +574,12 @@ fn list_windows() -> Out {
             continue;
         }
         seen.push(app.clone());
-        lines.push(format!("{app} — «{title}» ({})", match tier(&app) { "read" => "view only", "click" => "clicks only", _ => "full control" }));
+        let level = match tier(&app) { "read" => "a browser: view only even when granted", "click" => "terminal or code editor: clicks only when granted", _ => "full control when granted" };
+        let state = if granted(args, &app) { "GRANTED in this chat" } else { "not granted — computer_request_access first" };
+        lines.push(format!("{app} — «{title}» ({state}; {level})"));
+    }
+    if locked() {
+        lines.insert(0, LOCKED.to_string());
     }
     Ok(json!({ "ok": true, "text": lines.join("\n"), "meta": { "apps": seen } }))
 }
@@ -577,10 +609,62 @@ fn open_application(args: &Value) -> Out {
     ok(format!("Started «{name}». Take a screenshot to see its window."))
 }
 
+/// Окно для дерева: по имени программы или переднее. Окна самой Fizmat — нет.
+fn target(args: &Value) -> Result<(HWND, String, String), String> {
+    let name = args["name"].as_str().unwrap_or("").trim().trim_end_matches(".exe").to_lowercase();
+    let found = if name.is_empty() {
+        let hwnd = unsafe { GetForegroundWindow() };
+        (!hwnd.is_null()).then(|| {
+            let (_, app) = owner(hwnd);
+            (hwnd, app, title(hwnd))
+        })
+    } else {
+        windows().into_iter().find(|(_, app, _)| *app == name)
+    };
+    let (hwnd, app, title) = found.ok_or_else(|| if name.is_empty() { "no window is in front".to_string() } else { format!("«{name}» has no open window — see list_windows") })?;
+    if owner(hwnd).0 == unsafe { GetCurrentProcessId() } || app == "fizmat" || app == "fizmat-guard" {
+        return Err("this is the Fizmat app itself — it is not shown to the model".into());
+    }
+    Ok((hwnd, app, title))
+}
+
+/// UI Automation: элементы окна (кнопки, поля, пункты) с центрами в пикселях последнего снимка.
+fn ui(args: &Value, find: bool) -> Out {
+    let v = view()?;
+    let (hwnd, app, title) = target(args)?;
+    let query = if find {
+        Some(args["text"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("ui_find needs `text` — a word from the element's name")?)
+    } else {
+        None
+    };
+    let to_shot = move |x: i32, y: i32| {
+        (x >= v.x && y >= v.y && x < v.x + v.w && y < v.y + v.h)
+            .then(|| ((((x - v.x) as f64) / v.scale).round() as i32, (((y - v.y) as f64) / v.scale).round() as i32))
+    };
+    let (text, cut) = crate::ui::read(hwnd as isize, query, &to_shot)?;
+    let mut head = format!("UI of {app} — «{title}». Coordinates (x, y) are element centres in the latest screenshot's pixels: click them as they are.");
+    if unsafe { IsIconic(hwnd) } != 0 {
+        head.push_str(" The window is MINIMIZED: its elements are not on screen — bring it up with open_application first, then read the tree again.");
+    }
+    let body = match (text.is_empty(), query) {
+        (true, Some(q)) => format!("Nothing named like «{q}» in this window. Try another word, ui_tree, or a screenshot."),
+        (true, None) => "This window exposes no accessible elements — work from screenshots.".to_string(),
+        (false, _) => text,
+    };
+    let tail = if cut { "\n(cut: the window has more elements — use ui_find with a word from the element you need)" } else { "" };
+    let lock = if locked() { format!("\n{LOCKED}") } else { String::new() };
+    ok(format!("{head}\n{body}{tail}{lock}"))
+}
+
 // ── Вход ─────────────────────────────────────────────────────────────────
 
 fn one(args: &Value) -> Out {
-    match args["action"].as_str().unwrap_or("") {
+    let action = args["action"].as_str().unwrap_or("");
+    let input = !matches!(action, "screenshot" | "zoom" | "switch_display" | "cursor_position" | "list_windows" | "wait" | "ui_tree" | "ui_find" | "read_clipboard");
+    if input && locked() {
+        return Err(LOCKED.into());
+    }
+    match action {
         "screenshot" => screenshot(),
         "zoom" => zoom(args),
         "switch_display" => {
@@ -589,7 +673,9 @@ fn one(args: &Value) -> Out {
             screenshot()
         }
         "cursor_position" => cursor().map(|(x, y)| ok(format!("The mouse is at ({x}, {y}) in the screenshot's pixels."))).unwrap_or_else(|| Err("no cursor".into())),
-        "list_windows" => list_windows(),
+        "list_windows" => list_windows(args),
+        "ui_tree" => ui(args, false),
+        "ui_find" => ui(args, true),
         "wait" => {
             std::thread::sleep(Duration::from_secs_f64(args["duration"].as_f64().unwrap_or(1.0).clamp(0.0, 10.0)));
             ok("Waited.")

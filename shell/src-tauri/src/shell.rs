@@ -117,33 +117,55 @@ impl Output {
     }
 }
 
-/// Вывод в UTF-8 — как есть; иначе это кодировка Windows (cp1251 у Python и
-/// многих программ в трубу). Обрезка головы и хвоста может разрезать один
-/// символ UTF-8 — пара битых байтов на краях ещё не повод менять кодировку.
+/// Вывод в UTF-8 — как есть; иначе это кодировка Windows: cp1251 (ANSI) у Python и
+/// многих программ в трубу, cp866 (OEM) у консольных — PowerShell, cmd, net, ipconfig.
+/// Из двух берём ту, где текст похож на русский: в чужой кодировке выходят «Ґ», «Є»,
+/// псевдографика. Обрезка головы и хвоста может разрезать один символ UTF-8 — пара
+/// битых байтов на краях ещё не повод менять кодировку.
 fn decode(bytes: &[u8]) -> String {
     let bad: usize = bytes.utf8_chunks().map(|c| c.invalid().len()).sum();
     if bad <= 4 {
         return String::from_utf8_lossy(bytes).to_string();
     }
-    ansi(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string())
+    let ansi = codepage(bytes, false);
+    let oem = codepage(bytes, true);
+    match (ansi, oem) {
+        (Some(a), Some(o)) => if russian(&o) > russian(&a) { o } else { a },
+        (Some(a), None) => a,
+        (None, Some(o)) => o,
+        (None, None) => String::from_utf8_lossy(bytes).to_string(),
+    }
+}
+
+/// Насколько текст похож на русский: обычные буквы — плюс, буквы чужих алфавитов
+/// кириллицы, псевдографика и редкие знаки из верхней половины таблицы — минус.
+fn russian(s: &str) -> i64 {
+    s.chars()
+        .map(|c| match c {
+            'а'..='я' | 'А'..='Я' | 'ё' | 'Ё' => 1,
+            '\u{0400}'..='\u{04FF}' | '\u{2500}'..='\u{259F}' | '\u{2010}'..='\u{2122}' | '\u{00A0}'..='\u{00BF}' => -2,
+            _ => 0,
+        })
+        .sum()
 }
 
 #[cfg(windows)]
-fn ansi(bytes: &[u8]) -> Option<String> {
-    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+fn codepage(bytes: &[u8], oem: bool) -> Option<String> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP, CP_OEMCP};
+    let cp = if oem { CP_OEMCP } else { CP_ACP };
     let len = i32::try_from(bytes.len()).ok()?;
     // SAFETY: буферы живые, длины переданы точно.
-    let n = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    let n = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
     if n <= 0 {
         return None;
     }
     let mut wide = vec![0u16; n as usize];
-    let n = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n) };
+    let n = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n) };
     (n > 0).then(|| String::from_utf16_lossy(&wide[..n as usize]))
 }
 
 #[cfg(not(windows))]
-fn ansi(_: &[u8]) -> Option<String> {
+fn codepage(_: &[u8], _: bool) -> Option<String> {
     None
 }
 
@@ -332,6 +354,15 @@ mod tests {
         // Обрезанный с краю символ UTF-8 не переводит весь вывод в cp1251.
         let cut = &"Привет".as_bytes()[1..];
         assert_eq!(decode(cut), "\u{FFFD}ривет");
+    }
+
+    #[test]
+    fn console_output_in_the_oem_code_page_is_read_right() {
+        // «Привет, мир» в cp866 — так пишут PowerShell и cmd.
+        let cp866 = [0x8F, 0xE0, 0xA8, 0xA2, 0xA5, 0xE2, 0x2C, 0x20, 0xAC, 0xA8, 0xE0];
+        if cfg!(windows) && unsafe { windows_sys::Win32::Globalization::GetOEMCP() } == 866 {
+            assert_eq!(decode(&cp866), "Привет, мир");
+        }
     }
 
     #[test]
