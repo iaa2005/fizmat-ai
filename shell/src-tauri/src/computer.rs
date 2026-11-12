@@ -327,7 +327,16 @@ fn allow(args: &Value, pid: u32, app: &str, need: &str) -> Result<(), String> {
     }
 }
 
+/// Экран, с которым модель работает сейчас, — для рамки (veil.rs).
+pub fn display() -> Option<RECT> {
+    let v = view().ok()?;
+    Some(RECT { left: v.x, top: v.y, right: v.x + v.w, bottom: v.y + v.h })
+}
+
 fn allow_at(args: &Value, x: i32, y: i32) -> Result<(), String> {
+    if crate::veil::covers(x, y) {
+        return Err("this spot is under the Fizmat window: while you control the computer it sits in the bottom-right corner on top of other windows and is hidden from screenshots. Move the target window or use another spot".into());
+    }
     let hwnd = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
     if hwnd.is_null() {
         return Err("there is no window at this point".into());

@@ -118,6 +118,8 @@ fn toggle_computer(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
     let state = app.state::<code::Code>();
     if code::computer_on(&state) {
         code::set_computer(&state, false);
+        #[cfg(windows)]
+        crate::veil::finish(app);
         let _ = item.set_checked(false);
         return;
     }

@@ -399,6 +399,12 @@ fn execute(app: &AppHandle, code: &Code, call: &Value, stop: &dyn Fn() -> bool) 
         #[cfg(windows)]
         {
             let on = computer_on(code);
+            // Рамка, плашка и окно Fizmat в углу — до действия: снимок уже не должен их видеть.
+            if on {
+                if let Some(r) = crate::computer::display() {
+                    crate::veil::touch(app, r);
+                }
+            }
             let result = crate::computer::run(&call["args"], on, &|| stop() || !computer_on(code));
             let action = call["args"]["action"].as_str().unwrap_or("?");
             if !matches!(action, "screenshot" | "zoom" | "cursor_position" | "wait" | "list_windows") {

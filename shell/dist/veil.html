@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fizmat</title>
+<!-- Покров на время управления компьютером (src-tauri/src/veil.rs): светящаяся рамка по краю экрана и
+     на несколько секунд — плашка по центру. Окно прозрачное, щелчки проходят сквозь него, в снимки
+     экрана оно не попадает (WDA_EXCLUDEFROMCAPTURE) — модель его не видит. -->
+<style>
+    html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; pointer-events: none; user-select: none; }
+    body { font: 500 15px/1.3 Manrope, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+
+    /* Рамка: тонкая линия цвета сайта (--clay) и мягкое свечение внутрь. */
+    .frame { position: fixed; inset: 0; opacity: 0; transition: opacity .45s ease;
+        box-shadow: inset 0 0 0 2px rgba(167, 139, 250, .95), inset 0 0 22px 4px rgba(139, 92, 246, .55), inset 0 0 70px 10px rgba(139, 92, 246, .22); }
+    .frame.on { opacity: 1; animation: breathe 3.2s ease-in-out .45s infinite; }
+    @keyframes breathe { 50% { opacity: .62; } }
+
+    /* Плашка: белая, как кнопка, по центру; проявляется и через несколько секунд уходит. */
+    .pill { position: fixed; left: 50%; top: 50%; display: flex; align-items: center; gap: 10px; padding: 13px 22px 13px 18px;
+        border-radius: 999px; background: #fff; color: #1f1e1d; white-space: nowrap;
+        box-shadow: 0 10px 36px rgba(28, 22, 51, .28), 0 0 0 1px rgba(0, 0, 0, .06);
+        opacity: 0; transform: translate(-50%, -50%) scale(.94); filter: blur(6px);
+        transition: opacity .35s ease, transform .35s cubic-bezier(.2, .8, .2, 1), filter .35s ease; }
+    .pill.on { opacity: 1; transform: translate(-50%, -50%); filter: none; }
+    .pill svg { width: 18px; height: 18px; flex: none; color: #8b5cf6; }
+</style>
+<body>
+<div class="frame" id="frame"></div>
+<div class="pill" id="pill">
+    <!-- lucide: monitor -->
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
+    <span>Fizmat использует Ваш компьютер</span>
+</div>
+<script>
+    const frame = document.getElementById('frame');
+    const pill = document.getElementById('pill');
+    let gone = null;
+
+    // Начало сеанса: рамка и плашка на 3,5 секунды.
+    window.fzStart = () => {
+        clearTimeout(gone);
+        frame.classList.add('on');
+        pill.classList.add('on');
+        gone = setTimeout(() => pill.classList.remove('on'), 3500);
+    };
+    // Конец: всё гаснет, окно программа спрячет следом.
+    window.fzEnd = () => {
+        clearTimeout(gone);
+        frame.classList.remove('on');
+        pill.classList.remove('on');
+    };
+    // Окно создано ради сеанса — начать сразу.
+    if (location.hash !== '#idle') requestAnimationFrame(() => window.fzStart());
+</script>

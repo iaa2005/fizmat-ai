@@ -18,6 +18,8 @@ mod glass;
 mod shell;
 mod tray;
 mod update;
+#[cfg(windows)]
+mod veil;
 
 use serde_json::Value;
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
