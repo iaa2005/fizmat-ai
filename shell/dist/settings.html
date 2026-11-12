@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Настройки Fizmat</title>
+<!-- Окно настроек программы (src-tauri/src/settings.rs): управление компьютером и «не гаснуть».
+     Включить управление можно только отсюда и только после подтверждения в окне Windows. -->
+<style>
+    :root { color-scheme: light dark; --bg: #faf9f5; --fg: #1f1e1d; --muted: #6f6c64; --line: rgba(0, 0, 0, .08); --card: #fff;
+        --on: #8b5cf6; --off: #d5d2ca; }
+    @media (prefers-color-scheme: dark) {
+        :root { --bg: #1f1e1d; --fg: #f5f4ef; --muted: #a3a09a; --line: rgba(255, 255, 255, .08); --card: #262522; --off: #4a4843; --on: #a78bfa; }
+    }
+    html, body { margin: 0; background: var(--bg); color: var(--fg); }
+    body { font: 14px/1.45 Manrope, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; padding: 22px 22px 18px; user-select: none; }
+    h1 { font-size: 17px; font-weight: 600; margin: 0 0 4px; }
+    .who { color: var(--muted); font-size: 13px; margin: 0 0 18px; }
+    .row { display: flex; gap: 14px; align-items: flex-start; padding: 14px 16px; background: var(--card); border: 1px solid var(--line);
+        border-radius: 14px; margin-bottom: 10px; }
+    .row .t { flex: 1; min-width: 0; }
+    .row b { display: block; font-weight: 600; margin-bottom: 3px; }
+    .row p { margin: 0; color: var(--muted); font-size: 12.5px; }
+    .sw { flex: none; width: 40px; height: 24px; border-radius: 99px; border: 0; background: var(--off); position: relative; cursor: pointer;
+        transition: background .18s; margin-top: 2px; }
+    .sw::after { content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, .25); transition: transform .18s; }
+    .sw[aria-checked=true] { background: var(--on); }
+    .sw[aria-checked=true]::after { transform: translateX(16px); }
+    .sw:disabled { opacity: .5; cursor: default; }
+    .note { color: var(--muted); font-size: 12px; margin: 14px 2px 0; }
+</style>
+<body>
+<h1>Настройки</h1>
+<p class="who" id="who">…</p>
+
+<div class="row">
+    <div class="t">
+        <b>Управление компьютером</b>
+        <p>Модель видит экран и управляет мышью и клавиатурой — только в приложениях, которые вы разрешите в чате. Браузеры — только просмотр, терминалы — только щелчки.</p>
+    </div>
+    <button class="sw" id="computer" role="switch" aria-checked="false" aria-label="Управление компьютером"></button>
+</div>
+
+<div class="row">
+    <div class="t">
+        <b>Не гасить экран и не блокировать</b>
+        <p>Пока включено, Windows не гасит экран и не засыпает от бездействия — значит, и не запирается, когда вы управляете компьютером издалека. Кто сядет за компьютер, сможет им пользоваться.</p>
+    </div>
+    <button class="sw" id="awake" role="switch" aria-checked="false" aria-label="Не гасить экран и не блокировать"></button>
+</div>
+
+<p class="note">Win+L блокирует компьютер как обычно. На заблокированном экране модель может только читать окна, нажимать кнопки и заполнять поля — без мыши и клавиатуры.</p>
+
+<script>
+    const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
+    const sw = { computer: document.getElementById('computer'), awake: document.getElementById('awake') };
+
+    function paint(s) {
+        for (const k of ['computer', 'awake']) { sw[k].setAttribute('aria-checked', String(!!s[k])); sw[k].disabled = false; }
+        document.getElementById('who').textContent = s.paired ? `Компьютер «${s.name}» привязан к fizmat.ai` : `Компьютер «${s.name}» ещё не привязан к fizmat.ai`;
+    }
+    const load = () => invoke('settings_get').then(paint).catch(() => {});
+
+    for (const [key, el] of Object.entries(sw)) {
+        el.addEventListener('click', async () => {
+            el.disabled = true;
+            // Включение управления подтверждается в окне Windows — ответ придёт событием.
+            try { paint(await invoke('settings_set', { key, on: el.getAttribute('aria-checked') !== 'true' })); } catch { load(); }
+        });
+    }
+    window.__TAURI__.event.listen('settings-changed', load);
+    load();
+</script>

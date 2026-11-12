@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "fizmat-settings",
+  "description": "Окно настроек программы (dist/settings.html): управление компьютером и «не гасить экран».",
+  "windows": [
+    "settings"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-settings-get",
+    "allow-settings-set"
+  ]
+}

@@ -121,7 +121,7 @@ fn capture(x: i32, y: i32, w: i32, h: i32) -> Result<Vec<u8>, String> {
         DeleteDC(mem);
         ReleaseDC(null_mut(), screen);
         if copied == 0 || rows == 0 {
-            return Err("the screen could not be captured (locked screen or a protected window?)".into());
+            return Err("the screen could not be captured: Windows is not drawing it now — the session is shown over Remote Desktop with its window minimized or disconnected, the display is off, or a protected window is in front. ui_tree / ui_find / ui_press / ui_set_value still work; for the picture ask the person to restore the Remote Desktop window or turn on «Не гасить экран» in the Fizmat settings".into());
         }
         let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
         for px in bgra.chunks_exact(4) {
@@ -184,7 +184,7 @@ fn picture(x: i32, y: i32, w: i32, h: i32, scale: f64, note: String) -> Out {
 }
 
 /// Что сказать модели, когда Windows на экране блокировки.
-const LOCKED: &str = "THE COMPUTER IS LOCKED (Windows lock screen): screenshots show only the lock screen and clicks, typing and the clipboard do not reach applications. Tell the person to unlock it (you never enter PINs or passwords) and stop — do not look for workarounds";
+const LOCKED: &str = "THE COMPUTER IS LOCKED (Windows lock screen): screenshots show only the lock screen and clicks, typing and the clipboard do not reach applications. What still works: ui_tree / ui_find to read windows and ui_press / ui_set_value to press and fill their elements in granted regular Windows programs (not browsers or Electron apps). For anything else tell the person to unlock it (you never enter PINs or passwords) — do not look for other workarounds";
 
 /// Экран блокировки: ввод уходит на защищённый рабочий стол или впереди LockApp.
 pub fn locked() -> bool {
@@ -656,11 +656,32 @@ fn ui(args: &Value, find: bool) -> Out {
     ok(format!("{head}\n{body}{tail}{lock}"))
 }
 
+/// Нажать элемент или вписать значение через UI Automation — с теми же замками, что щелчок и ввод.
+fn ui_act(args: &Value) -> Out {
+    let (hwnd, app, title) = target(args)?;
+    let press = args["action"] == "ui_press";
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    allow(args, pid, &app, if press { "click" } else { "type" })?;
+    let query = args["text"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("`text` — the element's name, as ui_tree / ui_find show it")?;
+    let index = args["index"].as_u64().unwrap_or(1).clamp(1, 50) as usize;
+    let role = args["role"].as_str().filter(|s| !s.trim().is_empty());
+    let what = if press {
+        crate::ui::Act::Press
+    } else {
+        crate::ui::Act::SetValue(args["value"].as_str().ok_or("`value` — the text to put into the field")?)
+    };
+    let done = crate::ui::act(hwnd as isize, query, role, index, what)?;
+    ok(format!("In {app} — «{title}»: {done}"))
+}
+
 // ── Вход ─────────────────────────────────────────────────────────────────
 
 fn one(args: &Value) -> Out {
     let action = args["action"].as_str().unwrap_or("");
-    let input = !matches!(action, "screenshot" | "zoom" | "switch_display" | "cursor_position" | "list_windows" | "wait" | "ui_tree" | "ui_find" | "read_clipboard");
+    // ui_press / ui_set_value идут мимо мыши и клавиатуры — им блокировка экрана не помеха.
+    let input = !matches!(action, "screenshot" | "zoom" | "switch_display" | "cursor_position" | "list_windows" | "wait" | "ui_tree" | "ui_find"
+        | "ui_press" | "ui_set_value" | "read_clipboard");
     if input && locked() {
         return Err(LOCKED.into());
     }
@@ -676,6 +697,7 @@ fn one(args: &Value) -> Out {
         "list_windows" => list_windows(args),
         "ui_tree" => ui(args, false),
         "ui_find" => ui(args, true),
+        "ui_press" | "ui_set_value" => ui_act(args),
         "wait" => {
             std::thread::sleep(Duration::from_secs_f64(args["duration"].as_f64().unwrap_or(1.0).clamp(0.0, 10.0)));
             ok("Waited.")

@@ -42,9 +42,12 @@ pub struct Config {
     pub token: Option<String>,
     #[serde(default)]
     pub roots: Vec<Root>,
-    /// «Управление компьютером» (Computer Use): включает человек в трее; по умолчанию выключено.
+    /// «Управление компьютером» (Computer Use): включает человек в настройках программы; по умолчанию выключено.
     #[serde(default)]
     pub computer: bool,
+    /// «Не гасить экран и не блокировать» (awake.rs): включает человек в настройках программы.
+    #[serde(default)]
+    pub awake: bool,
 }
 
 pub struct Code {
@@ -126,7 +129,7 @@ pub fn computer_on(code: &Code) -> bool {
     code.cfg.lock().unwrap().computer
 }
 
-/// Включить или выключить управление компьютером (трей) и сразу сказать сайту.
+/// Включить или выключить управление компьютером (настройки) и сразу сказать сайту.
 pub fn set_computer(code: &Code, on: bool) {
     code.cfg.lock().unwrap().computer = on;
     code.save();
@@ -134,7 +137,20 @@ pub fn set_computer(code: &Code, on: bool) {
     let _ = code.hello();
 }
 
-fn computer_name() -> String {
+/// Не гасить экран и не блокировать по бездействию (awake.rs).
+pub fn awake_on(code: &Code) -> bool {
+    code.cfg.lock().unwrap().awake
+}
+
+pub fn set_awake(code: &Code, on: bool) {
+    code.cfg.lock().unwrap().awake = on;
+    code.save();
+    #[cfg(windows)]
+    crate::awake::set(on);
+    journal("-", "awake", "не гасить экран", if on { "включено" } else { "выключено" });
+}
+
+pub fn computer_name() -> String {
     std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "Компьютер".into())
 }
 

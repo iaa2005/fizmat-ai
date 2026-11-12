@@ -1,6 +1,7 @@
-// Дерево элементов окна через UI Automation (Windows) — чтобы модель находила кнопки, поля и пункты
-// меню по названию, а не угадывала по картинке. Только чтение: нажимает модель по-прежнему
-// действиями computer по координатам, которые отсюда и берёт (в пикселях последнего снимка).
+// Элементы окна через UI Automation (Windows) — чтобы модель находила кнопки, поля и пункты меню по
+// названию, а не угадывала по картинке. read — дерево или поиск с координатами в пикселях снимка;
+// act — нажать элемент или вписать значение без мыши и клавиатуры: так работает и в свёрнутом окне,
+// и на заблокированном экране (у обычных программ Windows; Electron и браузеры своё дерево почти не дают).
 //
 // Chromium и Electron строят дерево страницы по первому запросу — если пришло почти пустое
 // дерево с документом внутри, спрашиваем ещё раз через секунду.
@@ -97,6 +98,121 @@ impl Walk<'_> {
             child = self.walker.get_next_sibling(&c).ok();
         }
     }
+}
+
+/// Что сделать с элементом.
+pub enum Act<'a> {
+    Press,
+    SetValue(&'a str),
+}
+
+/// Элементы окна с названием query: сначала точные совпадения, потом содержащие; role — фильтр по виду.
+fn matching(walker: &UITreeWalker, root: &UIElement, query: &str, role_filter: Option<&str>) -> Vec<(UIElement, ControlType, String)> {
+    let q = query.trim().to_lowercase();
+    let mut exact = Vec::new();
+    let mut partial = Vec::new();
+    let started = Instant::now();
+    let mut stack = vec![(root.clone(), 0usize)];
+    while let Some((e, depth)) = stack.pop() {
+        if started.elapsed() > BUDGET || exact.len() + partial.len() > 50 {
+            break;
+        }
+        let kind = e.get_control_type().unwrap_or(ControlType::Custom);
+        let name = e.get_name().unwrap_or_default();
+        let lower = name.trim().to_lowercase();
+        let fits = role_filter.map(|r| role(kind) == r.trim().to_lowercase()).unwrap_or(true);
+        if fits && !lower.is_empty() {
+            if lower == q {
+                exact.push((e.clone(), kind, name.trim().to_string()));
+            } else if lower.contains(&q) {
+                partial.push((e.clone(), kind, name.trim().to_string()));
+            }
+        }
+        if depth < MAX_DEPTH {
+            // Дети в обратном порядке — со стека они выйдут в порядке дерева.
+            let mut kids = Vec::new();
+            let mut child = walker.get_first_child(&e).ok();
+            while let Some(c) = child {
+                child = walker.get_next_sibling(&c).ok();
+                kids.push(c);
+            }
+            for c in kids.into_iter().rev() {
+                stack.push((c, depth + 1));
+            }
+        }
+    }
+    exact.extend(partial);
+    exact
+}
+
+fn press(e: &UIElement) -> Result<&'static str, String> {
+    use uiautomation::patterns::{UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern, UISelectionItemPattern, UITogglePattern};
+    if let Ok(p) = e.get_pattern::<UIInvokePattern>() {
+        if p.invoke().is_ok() {
+            return Ok("invoked");
+        }
+    }
+    if let Ok(p) = e.get_pattern::<UITogglePattern>() {
+        if p.toggle().is_ok() {
+            return Ok("toggled");
+        }
+    }
+    if let Ok(p) = e.get_pattern::<UISelectionItemPattern>() {
+        if p.select().is_ok() {
+            return Ok("selected");
+        }
+    }
+    if let Ok(p) = e.get_pattern::<UIExpandCollapsePattern>() {
+        if p.expand().is_ok() {
+            return Ok("expanded");
+        }
+    }
+    if let Ok(p) = e.get_pattern::<UILegacyIAccessiblePattern>() {
+        if p.do_default_action().is_ok() {
+            return Ok("default action done");
+        }
+    }
+    Err("this element cannot be pressed through UI Automation — click it at its coordinates instead".into())
+}
+
+fn set_value(e: &UIElement, value: &str) -> Result<&'static str, String> {
+    use uiautomation::patterns::{UILegacyIAccessiblePattern, UIValuePattern};
+    if let Ok(p) = e.get_pattern::<UIValuePattern>() {
+        if p.is_readonly().unwrap_or(false) {
+            return Err("this field is read-only".into());
+        }
+        if p.set_value(value).is_ok() {
+            return Ok("value set");
+        }
+    }
+    if let Ok(p) = e.get_pattern::<UILegacyIAccessiblePattern>() {
+        if p.set_value(value).is_ok() {
+            return Ok("value set");
+        }
+    }
+    Err("this element takes no value through UI Automation — click into it and use type instead".into())
+}
+
+/// Нажать элемент или вписать значение. index — какое из совпадений (с 1), по умолчанию первое.
+pub fn act(hwnd: isize, query: &str, role_filter: Option<&str>, index: usize, what: Act) -> Result<String, String> {
+    let ua = automation()?;
+    let root = ua.element_from_handle(Handle::from(hwnd)).map_err(|e| format!("the window cannot be read: {e}"))?;
+    let walker = ua.get_control_view_walker().map_err(|e| e.to_string())?;
+    let found = matching(&walker, &root, query, role_filter);
+    if found.is_empty() {
+        return Err(format!("no element named like «{}» in this window — look with ui_find or ui_tree", query.trim()));
+    }
+    let n = found.len();
+    let (e, kind, name) = found.into_iter().nth(index.max(1) - 1).ok_or_else(|| format!("only {n} elements match «{}»", query.trim()))?;
+    if !e.is_enabled().unwrap_or(true) {
+        return Err(format!("{} «{name}» is disabled", role(kind)));
+    }
+    let done = match what {
+        Act::Press => press(&e)?,
+        Act::SetValue(v) => set_value(&e, v)?,
+    };
+    let more = if n > 1 { format!(" ({n} elements matched; this was #{}; pass index for another)", index.max(1)) } else { String::new() };
+    Ok(format!("{} «{name}»: {done}.{more} Take a screenshot or read the tree to see the result.", role(kind)))
 }
 
 fn automation() -> Result<UIAutomation, String> {

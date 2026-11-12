@@ -2,13 +2,13 @@
 //
 // Левая кнопка — строка «Чем помочь?» поверх экрана (окно quick, dist/quick.html): вопрос
 // уходит новым чатом fizmat.ai с моделью по умолчанию, окно программы открывается на нём.
-// Правая кнопка — меню: открыть Fizmat, подписка и расход (GET /api/code/me раз в минуту),
+// Правая кнопка — меню: открыть Fizmat, подписка и расход (GET /api/code/me раз в минуту), «Настройки…»
+// (управление компьютером и «не гасить экран» — окно settings.rs),
 // остановить команды модели, выйти. Крестик главного окна прячет его сюда (main.rs).
 
 use std::time::Duration;
 
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
@@ -112,43 +112,13 @@ pub fn quick_hide(app: AppHandle) {
     }
 }
 
-/// «Управление компьютером» в трее: включить — только после подтверждения в окне программы
-/// (страница сайта этого сделать не может), выключить — сразу; идущее действие обрывается.
-fn toggle_computer(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
-    let state = app.state::<code::Code>();
-    if code::computer_on(&state) {
-        code::set_computer(&state, false);
-        #[cfg(windows)]
-        crate::veil::finish(app);
-        let _ = item.set_checked(false);
-        return;
-    }
-    // Галочку ставим только после «Разрешить».
-    let _ = item.set_checked(false);
-    let (app, item) = (app.clone(), item.clone());
-    app.clone().dialog()
-        .message("Модель сможет видеть экран этого компьютера, двигать мышь и печатать — в приложениях, которые вы разрешите ей в чате.\n\nБраузеры остаются только для просмотра, терминалы — только для щелчков. Выключить можно здесь же в любой момент.")
-        .title("Разрешить управление компьютером?")
-        .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom("Разрешить".into(), "Отмена".into()))
-        .show(move |yes| {
-            if yes {
-                std::thread::spawn(move || {
-                    code::set_computer(&app.state::<code::Code>(), true);
-                    let _ = item.set_checked(true);
-                });
-            }
-        });
-}
-
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Открыть Fizmat", true, None::<&str>)?;
     let plan = MenuItem::with_id(app, "plan", "Компьютер не привязан", false, None::<&str>)?;
     let usage = MenuItem::with_id(app, "usage", "Расход: —", false, None::<&str>)?;
     let stop = MenuItem::with_id(app, "stop", "Остановить команды", false, None::<&str>)?;
-    // Computer Use: модель видит экран и управляет мышью и клавиатурой — только пока включено здесь.
-    let computer = CheckMenuItem::with_id(app, "computer", "Управление компьютером", true, code::computer_on(&app.state::<code::Code>()), None::<&str>)?;
-    let computer_item = computer.clone();
+    // Управление компьютером и «не гасить экран» — в окне настроек.
+    let settings = MenuItem::with_id(app, "settings", "Настройки…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[
         &open,
@@ -156,7 +126,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         &plan,
         &usage,
         &PredefinedMenuItem::separator(app)?,
-        &computer,
+        &settings,
         &stop,
         &quit,
     ])?;
@@ -166,7 +136,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, e| match e.id.as_ref() {
             "open" => show_main(app),
-            "computer" => toggle_computer(app, &computer_item),
+            "settings" => crate::settings::open(app),
             "stop" => shell::stop_all(),
             "quit" => app.exit(0),
             _ => {}

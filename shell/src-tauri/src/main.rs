@@ -15,7 +15,10 @@ mod code;
 #[cfg(windows)]
 mod computer;
 mod glass;
+mod settings;
 mod shell;
+#[cfg(windows)]
+mod awake;
 mod tray;
 #[cfg(windows)]
 mod ui;
@@ -188,10 +191,15 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![guard, code::code_status, code::code_pair, code::code_add_root, code::code_remove_root, code::code_ticket,
-            tray::quick_ask, tray::quick_hide])
+            tray::quick_ask, tray::quick_hide, settings::settings_get, settings::settings_set])
         .setup(|app| {
             // Fizmat Code: компьютер уже привязан — сразу спрашивать вызовы модели.
             code::start(app.handle().clone());
+            // «Не гасить экран» — как было до перезапуска.
+            #[cfg(windows)]
+            if code::awake_on(&app.state::<code::Code>()) {
+                awake::set(true);
+            }
             *app.state::<Guard>().child.lock().unwrap() = start_service(app.path().resource_dir().ok());
             tray::build(app.handle())?;
             // Сначала — новая версия, если она есть (ставится сама); потом окно fizmat.ai.
