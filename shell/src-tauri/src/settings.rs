@@ -1,6 +1,8 @@
-// Окно настроек программы (dist/settings.html): «Управление компьютером» и «Не гасить экран и не
-// блокировать». Включить управление — только после подтверждения в родном окне Windows: ни страница
-// fizmat.ai, ни модель (окна Fizmat ей недоступны) этого сделать не могут. Выключить — сразу.
+// Настройки программы: «Remote Control» (модель видит экран и управляет мышью и клавиатурой) и «Не
+// гасить экран и не блокировать». Живут в настройках сайта (Настройки → Компьютер, окно main зовёт
+// settings_get / settings_set); окно dist/settings.html — запасное, когда сайт в окне не открыт.
+// Включить Remote Control — только после подтверждения в родном окне Windows: ни страница fizmat.ai,
+// ни модель (окна Fizmat ей недоступны) этого сделать не могут. Выключить — сразу.
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -8,7 +10,16 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 use crate::code;
 
+/// «Настройки…» из трея: окно программы с разделом «Компьютер» настроек сайта; сайт не открыт — запасное окно.
 pub fn open(app: &AppHandle) {
+    if let Some(main) = app.get_webview_window("main") {
+        let on_site = main.url().ok().and_then(|u| u.host_str().map(|h| h == "fizmat.ai" || h.ends_with(".fizmat.ai"))).unwrap_or(false);
+        if on_site {
+            crate::tray::show_main(app);
+            let _ = main.eval("window.FizmatSettings ? window.FizmatSettings.open('computer') : null");
+            return;
+        }
+    }
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -32,6 +43,7 @@ fn state(app: &AppHandle) -> Value {
 
 fn changed(app: &AppHandle) {
     let _ = app.emit_to("settings", "settings-changed", ());
+    let _ = app.emit_to("main", "settings-changed", ());
 }
 
 #[tauri::command]
@@ -52,7 +64,7 @@ pub async fn settings_set(key: String, on: bool, app: AppHandle) -> Result<Value
             let later = app.clone();
             app.dialog()
                 .message("Модель сможет видеть экран этого компьютера, двигать мышь и печатать — в приложениях, которые вы разрешите ей в чате.\n\nБраузеры остаются только для просмотра, терминалы — только для щелчков. Выключить можно в настройках в любой момент.")
-                .title("Разрешить управление компьютером?")
+                .title("Включить Remote Control?")
                 .kind(MessageDialogKind::Warning)
                 .buttons(MessageDialogButtons::OkCancelCustom("Разрешить".into(), "Отмена".into()))
                 .show(move |yes| {

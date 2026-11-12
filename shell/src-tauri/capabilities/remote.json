@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "fizmat-remote",
-  "description": "Страницы fizmat.ai зовут guard (личные данные) и code_* (раздел Code: привязка, папки).",
+  "description": "Страницы fizmat.ai зовут guard (личные данные), code_* (раздел Code: привязка, папки) и settings_* (Настройки → Компьютер: Remote Control и «не гасить экран»; включить Remote Control программа подтверждает своим окном Windows).",
   "windows": [
     "main"
   ],
@@ -18,6 +18,8 @@
     "allow-code-pair",
     "allow-code-add-root",
     "allow-code-remove-root",
-    "allow-code-ticket"
+    "allow-code-ticket",
+    "allow-settings-get",
+    "allow-settings-set"
   ]
 }

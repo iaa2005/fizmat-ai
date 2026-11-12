@@ -3,7 +3,7 @@
 // Левая кнопка — строка «Чем помочь?» поверх экрана (окно quick, dist/quick.html): вопрос
 // уходит новым чатом fizmat.ai с моделью по умолчанию, окно программы открывается на нём.
 // Правая кнопка — меню: открыть Fizmat, подписка и расход (GET /api/code/me раз в минуту), «Настройки…»
-// (управление компьютером и «не гасить экран» — окно settings.rs),
+// (Remote Control и «не гасить экран» — раздел «Компьютер» настроек сайта, settings.rs),
 // остановить команды модели, выйти. Крестик главного окна прячет его сюда (main.rs).
 
 use std::time::Duration;
@@ -117,7 +117,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let plan = MenuItem::with_id(app, "plan", "Компьютер не привязан", false, None::<&str>)?;
     let usage = MenuItem::with_id(app, "usage", "Расход: —", false, None::<&str>)?;
     let stop = MenuItem::with_id(app, "stop", "Остановить команды", false, None::<&str>)?;
-    // Управление компьютером и «не гасить экран» — в окне настроек.
+    // Remote Control и «не гасить экран» — в настройках сайта (Настройки → Компьютер).
     let settings = MenuItem::with_id(app, "settings", "Настройки…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[

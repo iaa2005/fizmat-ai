@@ -1,8 +1,9 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>Настройки Fizmat</title>
-<!-- Окно настроек программы (src-tauri/src/settings.rs): управление компьютером и «не гаснуть».
-     Включить управление можно только отсюда и только после подтверждения в окне Windows. -->
+<!-- Запасное окно настроек программы (src-tauri/src/settings.rs), когда сайт в окне не открыт: Remote Control
+     и «не гаснуть». Обычно те же переключатели — в настройках сайта (Настройки → Компьютер).
+     Включить Remote Control можно только после подтверждения в окне Windows. -->
 <style>
     :root { color-scheme: light dark; --bg: #faf9f5; --fg: #1f1e1d; --muted: #6f6c64; --line: rgba(0, 0, 0, .08); --card: #fff;
         --on: #8b5cf6; --off: #d5d2ca; }
@@ -33,10 +34,10 @@
 
 <div class="row">
     <div class="t">
-        <b>Управление компьютером</b>
+        <b>Remote Control</b>
         <p>Модель видит экран и управляет мышью и клавиатурой — только в приложениях, которые вы разрешите в чате. Браузеры — только просмотр, терминалы — только щелчки.</p>
     </div>
-    <button class="sw" id="computer" role="switch" aria-checked="false" aria-label="Управление компьютером"></button>
+    <button class="sw" id="computer" role="switch" aria-checked="false" aria-label="Remote Control"></button>
 </div>
 
 <div class="row">

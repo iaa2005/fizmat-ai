@@ -2,7 +2,7 @@
 // окна — руками модели, по набору действий Claude (screenshot, zoom, left_click, type, key…).
 //
 // Три замка, и все — здесь, в программе, а не на сайте:
-// 1. Общий выключатель «Управление компьютером» (трей). Выключен — ни одного действия.
+// 1. Общий выключатель «Remote Control» (Настройки → Компьютер). Выключен — ни одного действия.
 // 2. Приложения: сайт присылает список разрешённых человеком в чате (apps). Щелчок идёт
 //    только в окно разрешённого приложения, ввод — только когда оно впереди.
 // 3. Уровни, как у Claude: браузеры — только смотреть (иначе модель нажала бы «Разрешить»
@@ -785,7 +785,7 @@ fn one(args: &Value) -> Out {
 /// stop — человек выключил управление или остановил ход.
 pub fn run(args: &Value, enabled: bool, stop: &dyn Fn() -> bool) -> Out {
     if !enabled {
-        return Err("computer control is switched off in the Fizmat app on this computer — the person turns it on in the tray menu («Управление компьютером»)".into());
+        return Err("computer control is switched off in the Fizmat app on this computer — the person turns on Remote Control in Fizmat settings (Настройки → Компьютер)".into());
     }
     if args["action"] != "batch" {
         return one(args);

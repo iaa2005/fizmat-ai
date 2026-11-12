@@ -1,6 +1,6 @@
 [package]
 name = "fizmat-guard"
-version = "0.6.3"
+version = "0.6.4"
 description = "Fizmat с защитой личных данных на устройстве"
 edition = "2021"
 
