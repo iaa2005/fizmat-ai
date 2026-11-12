@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-code-terminal"
+description = "Enables the code_terminal command without any pre-configured scope."
+commands.allow = ["code_terminal"]
+
+[[permission]]
+identifier = "deny-code-terminal"
+description = "Denies the code_terminal command without any pre-configured scope."
+commands.deny = ["code_terminal"]

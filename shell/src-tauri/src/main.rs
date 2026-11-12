@@ -1,8 +1,7 @@
-// Fizmat с защитой личных данных: окно с fizmat.ai, рядом — локальная прослойка
-// (PII-Tracer + правила, guard/server.py). Страница зовёт команду guard, программа
-// передаёт запрос прослойке с ключом; сама страница ключа не видит.
-// В установленной программе прослойка — guard/guard.exe среди ресурсов (PyInstaller),
-// модель она скачивает сама при первом запуске; в сборке для себя — server.py из .venv.
+// Fizmat для Windows: окно с fizmat.ai, трей, окружение чатов (папки, команды, Remote Control).
+// Прослойка личных данных (guard) с 0.6.5 не запускается и в страницу не встраивается:
+// её код ниже оставлен мёртвым до удаления, команда guard отвечает отказом.
+#![allow(dead_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs;
@@ -55,6 +54,40 @@ const HERE: &str = r#"
     document.readyState === 'loading' ? addEventListener('DOMContentLoaded', go) : go();
 })();
 "#;
+
+/// Заголовок окна — под тему сайта: страница говорит программе, тёмная она или светлая.
+const THEME: &str = r#"
+(() => {
+    if (window.top !== window) return;
+    const tell = () => {
+        const invoke = window.__TAURI__?.core?.invoke;
+        if (!invoke) return;
+        const dark = (document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')) === 'dark';
+        invoke('window_theme', { dark }).catch(() => {});
+    };
+    addEventListener('themechange', tell);
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', tell);
+    document.readyState === 'loading' ? addEventListener('DOMContentLoaded', tell) : tell();
+})();
+"#;
+
+/// Тёмный или светлый заголовок окна; на Windows 11 — ещё и точный цвет фона сайта.
+#[tauri::command]
+fn window_theme(dark: bool, app: AppHandle) {
+    let Some(w) = app.get_webview_window("main") else { return };
+    let _ = w.set_theme(Some(if dark { tauri::Theme::Dark } else { tauri::Theme::Light }));
+    #[cfg(windows)]
+    if let Ok(hwnd) = w.hwnd() {
+        use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+        // COLORREF 0x00BBGGRR: #181818 и #ffffff — фон страниц; текст заголовка — под него.
+        let (caption, text): (u32, u32) = if dark { (0x0018_1818, 0x00EF_F4F5) } else { (0x00FF_FFFF, 0x0000_0000) };
+        unsafe {
+            DwmSetWindowAttribute(hwnd.0 as _, 35, &caption as *const u32 as _, 4);
+            DwmSetWindowAttribute(hwnd.0 as _, 34, &caption as *const u32 as _, 4);
+            DwmSetWindowAttribute(hwnd.0 as _, 36, &text as *const u32 as _, 4);
+        }
+    }
+}
 
 struct Guard {
     token: String,
@@ -141,6 +174,9 @@ fn start_service(resources: Option<PathBuf>) -> Option<Child> {
 /// Запрос страницы к прослойке. Только три пути и здоровье — больше страница ничего не может.
 #[tauri::command]
 fn guard(path: String, body: Option<Value>, state: tauri::State<Guard>) -> Result<Value, String> {
+    if !alive() {
+        return Err("прослойка личных данных отключена".into());
+    }
     let url = format!("http://127.0.0.1:{PORT}{path}");
     let res = match path.as_str() {
         "/health" => ureq::get(&url).timeout(Duration::from_secs(2)).call(),
@@ -159,7 +195,7 @@ fn guard(path: String, body: Option<Value>, state: tauri::State<Guard>) -> Resul
 
 /// Окно fizmat.ai. Крестик прячет его в трей: Code ждёт вызовы модели и с закрытым окном.
 fn main_window(app: &AppHandle) {
-    let script = format!("window.__FZ_GUARD = {{ ipc: true }};\n{INJECT}\n{HERE}");
+    let script = format!("{HERE}\n{THEME}");
     let built = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(START_URL.parse().unwrap()))
         .title("Fizmat")
         .inner_size(1280.0, 860.0)
@@ -191,7 +227,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![guard, code::code_status, code::code_pair, code::code_add_root, code::code_remove_root, code::code_ticket,
-            tray::quick_ask, tray::quick_hide, settings::settings_get, settings::settings_set])
+            tray::quick_ask, tray::quick_hide, settings::settings_get, settings::settings_set, window_theme,
+            code::code_reveal, code::code_terminal])
         .setup(|app| {
             // Fizmat Code: компьютер уже привязан — сразу спрашивать вызовы модели.
             code::start(app.handle().clone());
@@ -200,7 +237,6 @@ fn main() {
             if code::awake_on(&app.state::<code::Code>()) {
                 awake::set(true);
             }
-            *app.state::<Guard>().child.lock().unwrap() = start_service(app.path().resource_dir().ok());
             tray::build(app.handle())?;
             // Сначала — новая версия, если она есть (ставится сама); потом окно fizmat.ai.
             update::at_start(app.handle().clone(), main_window);

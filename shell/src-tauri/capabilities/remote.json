@@ -20,6 +20,9 @@
     "allow-code-remove-root",
     "allow-code-ticket",
     "allow-settings-get",
-    "allow-settings-set"
+    "allow-settings-set",
+    "allow-window-theme",
+    "allow-code-reveal",
+    "allow-code-terminal"
   ]
 }

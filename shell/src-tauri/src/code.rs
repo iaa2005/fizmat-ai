@@ -243,6 +243,33 @@ pub fn code_remove_root(path: String, code: State<Code>) -> Result<Value, String
     Ok(status(&code))
 }
 
+/// Путь должен быть одной из открытых папок: страница не может открыть что угодно.
+fn open_root(path: &str, code: &State<Code>) -> Result<String, String> {
+    let known = code.cfg.lock().unwrap().roots.iter().any(|r| r.path == path);
+    if !known || !std::path::Path::new(path).is_dir() {
+        return Err("этой папки нет среди открытых".into());
+    }
+    Ok(path.to_string())
+}
+
+/// «Показать в Проводнике» — папка окружения.
+#[tauri::command]
+pub fn code_reveal(path: String, code: State<Code>) -> Result<(), String> {
+    let path = open_root(&path, &code)?;
+    std::process::Command::new("explorer.exe").arg(&path).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// «Открыть в терминале» — Windows Terminal, а нет его — PowerShell в этой папке.
+#[tauri::command]
+pub fn code_terminal(path: String, code: State<Code>) -> Result<(), String> {
+    let path = open_root(&path, &code)?;
+    if std::process::Command::new("wt.exe").args(["-d", &path]).spawn().is_ok() {
+        return Ok(());
+    }
+    std::process::Command::new("cmd.exe").args(["/c", "start", "", "powershell.exe", "-NoExit"]).current_dir(&path)
+        .spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 // ── Опрос сайта ──────────────────────────────────────────────────────────
 
 /// Фоновый опрос: раз в секунду, пока недавно были вызовы, иначе раз в три.
