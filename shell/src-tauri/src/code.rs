@@ -42,6 +42,9 @@ pub struct Config {
     pub token: Option<String>,
     #[serde(default)]
     pub roots: Vec<Root>,
+    /// «Управление компьютером» (Computer Use): включает человек в трее; по умолчанию выключено.
+    #[serde(default)]
+    pub computer: bool,
 }
 
 pub struct Code {
@@ -94,6 +97,7 @@ impl Code {
             .set("Accept", "application/json")
             .timeout(Duration::from_secs(15))
             .send_json(json!({ "version": VERSION, "platform": std::env::consts::OS, "shell": crate::shell::detect().name, "roots": roots,
+                "computer": self.cfg.lock().unwrap().computer,
                 "started": self.fresh.swap(false, Ordering::SeqCst) }));
         match res {
             Ok(_) => {
@@ -115,6 +119,19 @@ impl Code {
         drop(cfg);
         self.save();
     }
+}
+
+/// Включено ли управление компьютером.
+pub fn computer_on(code: &Code) -> bool {
+    code.cfg.lock().unwrap().computer
+}
+
+/// Включить или выключить управление компьютером (трей) и сразу сказать сайту.
+pub fn set_computer(code: &Code, on: bool) {
+    code.cfg.lock().unwrap().computer = on;
+    code.save();
+    journal("-", "computer", "управление компьютером", if on { "включено" } else { "выключено" });
+    let _ = code.hello();
 }
 
 fn computer_name() -> String {
@@ -249,8 +266,8 @@ pub fn start(app: AppHandle) {
                             std::thread::spawn(move || background(&app, &token, &call));
                             continue;
                         }
-                        // Команда может идти минутами — своим потоком, чтобы чтение и правка не ждали её.
-                        if call["tool"].as_str() == Some("bash") {
+                        // Команда может идти минутами, действия на экране — секундами: своим потоком, чтобы чтение и правка не ждали.
+                        if matches!(call["tool"].as_str(), Some("bash") | Some("computer")) {
                             let (app, token) = (app.clone(), token.clone());
                             std::thread::spawn(move || {
                                 let code = app.state::<Code>();
@@ -377,6 +394,21 @@ fn fail(msg: impl Into<String>) -> Value {
 }
 
 fn execute(app: &AppHandle, code: &Code, call: &Value, stop: &dyn Fn() -> bool) -> Value {
+    // Экран, мышь и клавиатура — не про папку: замки свои (computer.rs).
+    if call["tool"].as_str() == Some("computer") {
+        #[cfg(windows)]
+        {
+            let on = computer_on(code);
+            let result = crate::computer::run(&call["args"], on, &|| stop() || !computer_on(code));
+            let action = call["args"]["action"].as_str().unwrap_or("?");
+            if !matches!(action, "screenshot" | "zoom" | "cursor_position" | "wait" | "list_windows") {
+                journal("-", "computer", action, if result.is_ok() { "сделано" } else { "отказ" });
+            }
+            return result.unwrap_or_else(fail);
+        }
+        #[cfg(not(windows))]
+        return fail("computer control works only on Windows for now");
+    }
     let root = call["root"].as_str().unwrap_or("");
     // Корень — только из своих папок: сайт не может назвать чужую.
     if !code.cfg.lock().unwrap().roots.iter().any(|r| r.path == root) {
@@ -391,6 +423,8 @@ fn execute(app: &AppHandle, code: &Code, call: &Value, stop: &dyn Fn() -> bool) 
         "edit" => edit(app, root, args),
         "write" => write(app, root, args),
         "bash" => bash(root, args, stop),
+        "fetch" => fetch(root, args),
+        "store" => store(root, args),
         other => Err(format!("unknown tool: {other}")),
     };
     result.unwrap_or_else(fail)
@@ -542,6 +576,86 @@ fn read(root: &str, args: &Value) -> Result<Value, String> {
         out.push_str(&system(format!("Lines {}–{} of {total}.", start + 1, end)));
     }
     Ok(json!({ "ok": true, "text": out, "meta": { "lines": end - start, "total": total } }))
+}
+
+// ── Файлы как есть (картинки, перенос между компьютером и облаком) ───────
+//
+// Текстовые инструменты двоичного не читают. fetch отдаёт кусок файла base64
+// (сайт собирает файл по кускам), store пишет кусок: первый начинает файл,
+// следующие дописывают. Разрешение на запись спрашивает чат на сайте.
+
+const CHUNK: u64 = 1_500_000;
+const MAX_TRANSFER: u64 = 64 * 1024 * 1024;
+
+fn mime(p: &Path) -> &'static str {
+    match p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+fn fetch(root: &str, args: &Value) -> Result<Value, String> {
+    use std::io::{Seek, SeekFrom};
+    let rel = args["path"].as_str().unwrap_or("");
+    let (_, p) = inside(root, rel)?;
+    if p.is_dir() {
+        return Err("this is a directory, not a file".into());
+    }
+    if secret(&p) {
+        return Err("sensitive file (.env, keys) — not readable".into());
+    }
+    let size = fs::metadata(&p).map_err(|e| e.to_string())?.len();
+    if size > MAX_TRANSFER {
+        return Err(format!("the file is too large to transfer ({}, limit {})", human(size), human(MAX_TRANSFER)));
+    }
+    let offset = args["offset"].as_u64().unwrap_or(0).min(size);
+    let length = args["length"].as_u64().unwrap_or(CHUNK).clamp(1, CHUNK).min(size - offset);
+    let mut buf = vec![0u8; length as usize];
+    let mut f = fs::File::open(&p).map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(offset)).and_then(|_| f.read_exact(&mut buf)).map_err(|e| e.to_string())?;
+    if offset == 0 {
+        journal(root, "fetch", rel, &human(size));
+    }
+    Ok(json!({ "ok": true, "text": "", "meta": { "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf),
+        "size": size, "offset": offset, "eof": offset + length >= size, "mime": mime(&p) } }))
+}
+
+fn store(root: &str, args: &Value) -> Result<Value, String> {
+    use std::io::Write;
+    let rel = args["path"].as_str().unwrap_or("");
+    let (_, p) = target(root, rel)?;
+    if p.is_dir() {
+        return Err("this is a directory, not a file".into());
+    }
+    if secret(&p) {
+        return Err("sensitive file (.env, keys) — not writable".into());
+    }
+    let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args["data"].as_str().unwrap_or(""))
+        .map_err(|_| "broken data".to_string())?;
+    let append = args["append"].as_bool().unwrap_or(false);
+    let exists = p.exists();
+    if exists && !append && !args["overwrite"].as_bool().unwrap_or(false) {
+        return Err("the file exists — pass overwrite: true to replace it".into());
+    }
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create the directory: {e}"))?;
+    }
+    let done = if append {
+        fs::OpenOptions::new().append(true).open(&p).and_then(|mut f| f.write_all(&data))
+    } else {
+        fs::write(&p, &data)
+    };
+    done.map_err(|e| format!("cannot write: {e}"))?;
+    if !append {
+        journal(root, "store", rel, if exists { "заменён" } else { "создан" });
+    }
+    Ok(json!({ "ok": true, "text": format!("Wrote {} to {rel}", human(data.len() as u64)), "meta": { "bytes": data.len(), "created": !exists && !append } }))
 }
 
 fn mtime(p: &Path) -> std::time::SystemTime {

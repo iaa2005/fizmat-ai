@@ -12,6 +12,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 mod code;
+#[cfg(windows)]
+mod computer;
 mod glass;
 mod shell;
 mod tray;
