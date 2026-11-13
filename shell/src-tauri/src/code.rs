@@ -167,8 +167,15 @@ pub fn code_status(code: State<Code>) -> Value {
 }
 
 /// Ключ, выданный сайтом при «Подключить этот компьютер».
+// Команды, что ходят в сеть, — async и в отдельном потоке: синхронные Tauri выполняет в главном
+// потоке окна, и медленная сеть (VPN) вешала бы окно («Не отвечает»).
 #[tauri::command]
-pub fn code_pair(id: i64, token: String, app: AppHandle, code: State<Code>) -> Result<Value, String> {
+pub async fn code_pair(id: i64, token: String, app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pair(id, token, app)).await.map_err(|e| e.to_string())?
+}
+
+fn pair(id: i64, token: String, app: AppHandle) -> Result<Value, String> {
+    let code = app.state::<Code>();
     if !token.starts_with("fzd_") || token.len() > 200 {
         return Err("неверный ключ".into());
     }
@@ -179,7 +186,7 @@ pub fn code_pair(id: i64, token: String, app: AppHandle, code: State<Code>) -> R
     }
     code.save();
     code.hello()?;
-    start(app);
+    start(app.clone());
     Ok(status(&code))
 }
 
@@ -205,8 +212,12 @@ pub async fn code_add_root(app: AppHandle, code: State<'_, Code>) -> Result<Opti
 /// Билет на минуту для страницы fizmat.ai в этом окне: по нему сайт узнаёт, что чат открыт
 /// в программе на этом компьютере (Remote Control). Ключ устройства странице не отдаётся.
 #[tauri::command]
-pub fn code_ticket(code: State<Code>) -> Result<Value, String> {
+pub async fn code_ticket(code: State<'_, Code>) -> Result<Value, String> {
     let Some(token) = code.token() else { return Err("компьютер не привязан".into()) };
+    tauri::async_runtime::spawn_blocking(move || ticket(&token)).await.map_err(|e| e.to_string())?
+}
+
+fn ticket(token: &str) -> Result<Value, String> {
     ureq::post(&format!("{}/api/code/here", site()))
         .set("Authorization", &format!("Bearer {token}"))
         .set("Accept", "application/json")
@@ -236,11 +247,16 @@ pub fn paired(code: &Code) -> bool {
 }
 
 #[tauri::command]
-pub fn code_remove_root(path: String, code: State<Code>) -> Result<Value, String> {
-    code.cfg.lock().unwrap().roots.retain(|r| r.path != path);
-    code.save();
-    let _ = code.hello();
-    Ok(status(&code))
+pub async fn code_remove_root(path: String, app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let code = app.state::<Code>();
+        code.cfg.lock().unwrap().roots.retain(|r| r.path != path);
+        code.save();
+        let _ = code.hello();
+        Ok(status(&code))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Путь должен быть одной из открытых папок: страница не может открыть что угодно.
