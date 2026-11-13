@@ -14,6 +14,7 @@ mod code;
 #[cfg(windows)]
 mod computer;
 mod glass;
+mod links;
 mod notice;
 mod settings;
 mod shell;
@@ -198,18 +199,28 @@ fn guard(path: String, body: Option<Value>, state: tauri::State<Guard>) -> Resul
 /// рисует сама страница (fizmat.ai, partials/app-frame) — по этому флагу.
 const FRAMELESS: &str = "window.__FZ_FRAMELESS = true;";
 
-/// Окно fizmat.ai. Крестик прячет его в трей: Code ждёт вызовы модели и с закрытым окном.
-fn main_window(app: &AppHandle) {
+/// Окно страницы fizmat.ai — главное и те, что страница открывает в новом окне (target="_blank"):
+/// без рамки, со скриптами программы, новые окна и скачивания — через links.rs.
+pub(crate) fn site_window(app: &AppHandle, label: &str, url: tauri::Url) -> Option<tauri::WebviewWindow> {
     let script = format!("{FRAMELESS}\n{HERE}\n{THEME}");
-    let built = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(START_URL.parse().unwrap()))
+    let (opener, from) = (app.clone(), label.to_string());
+    let (w, h) = if label == "main" { (1280.0, 860.0) } else { (1180.0, 820.0) };
+    WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
         .title("Fizmat")
-        .inner_size(1280.0, 860.0)
+        .inner_size(w, h)
         .min_inner_size(420.0, 560.0)
         .decorations(false)
         .shadow(true)
         .initialization_script(&script)
-        .build();
-    let Ok(window) = built else { return };
+        .on_new_window(move |url, _| links::new_window(&opener, &from, url))
+        .on_download(|webview, event| links::download(&webview, event))
+        .build()
+        .ok()
+}
+
+/// Окно fizmat.ai. Крестик прячет его в трей: Code ждёт вызовы модели и с закрытым окном.
+fn main_window(app: &AppHandle) {
+    let Some(window) = site_window(app, "main", START_URL.parse().unwrap()) else { return };
     let hidden = window.clone();
     window.on_window_event(move |e| {
         if let WindowEvent::CloseRequested { api, .. } = e {
