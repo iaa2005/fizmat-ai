@@ -358,6 +358,24 @@ fn state(e: &UIElement, kind: ControlType) -> String {
     }
 }
 
+/// Колонки строки списка: «Размер: 89 КБ; Тип: Файл "BIN"» — из её детей (поля и подписи с названием колонки).
+fn columns(walker: &UITreeWalker, row: &UIElement, row_name: &str) -> String {
+    let mut parts = Vec::new();
+    let mut child = walker.get_first_child(row).ok();
+    while let Some(c) = child {
+        let kind = c.get_control_type().unwrap_or(ControlType::Custom);
+        if matches!(kind, ControlType::Edit | ControlType::Text | ControlType::DataItem) {
+            let col = c.get_name().unwrap_or_default().trim().to_string();
+            let val = value_of(&c).unwrap_or_default().replace(['\u{200e}', '\u{200f}'], "").trim().to_string();
+            if !col.is_empty() && !val.is_empty() && val != row_name && parts.len() < 6 {
+                parts.push(format!("{col}: {}", val.chars().take(40).collect::<String>()));
+            }
+        }
+        child = walker.get_next_sibling(&c).ok();
+    }
+    parts.join("; ")
+}
+
 pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limit: usize, budget: Duration) -> Result<(String, String), String> {
     let ua = automation()?;
     let root = ua.element_from_handle(Handle::from(hwnd)).map_err(|e| format!("the window cannot be read: {e}"))?;
@@ -390,13 +408,21 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
                             if !e.is_enabled().unwrap_or(true) {
                                 line.push_str(" disabled");
                             }
-                            let st = state(&e, kind);
+                            let mut st = state(&e, kind);
+                            // Строка списка с колонками (Проводник в виде «Таблица»): колонки — в ту же строку, «Размер: 89 КБ; …».
+                            if kind == ControlType::ListItem {
+                                let cols = columns(&walker, &e, &name);
+                                if !cols.is_empty() {
+                                    st = format!(" — {cols}");
+                                }
+                            }
                             // Пустая ячейка таблицы («B7») — не в список: их на экране сотни.
                             let empty_cell = kind == ControlType::DataItem && st.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric());
                             line.push_str(&st);
                             if !empty_cell && seen.insert(line.clone()) {
+                                // Дерево папок слева — не содержимое: оно не должно вытеснять файлы списка.
                                 let is_content = matches!(kind, ControlType::Edit | ControlType::ComboBox | ControlType::Document | ControlType::DataItem
-                                    | ControlType::ListItem | ControlType::TreeItem | ControlType::CheckBox | ControlType::RadioButton | ControlType::Slider | ControlType::Spinner);
+                                    | ControlType::ListItem | ControlType::CheckBox | ControlType::RadioButton | ControlType::Slider | ControlType::Spinner);
                                 if !act { texts.push(line) } else if is_content { content.push(line) } else { acts.push(line) }
                             }
                         }
@@ -405,7 +431,7 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
             }
         }
         // Внутрь кнопок и пунктов не идём: там их же подписи.
-        if depth < MAX_DEPTH && !(act && !matches!(kind, ControlType::Document | ControlType::ListItem | ControlType::TreeItem | ControlType::DataItem)) {
+        if depth < MAX_DEPTH && !(act && !matches!(kind, ControlType::Document | ControlType::TreeItem | ControlType::DataItem)) {
             let mut kids = Vec::new();
             let mut child = walker.get_first_child(&e).ok();
             while let Some(c) = child {
