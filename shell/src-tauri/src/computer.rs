@@ -275,15 +275,18 @@ fn elements(v: &View) -> String {
 }
 
 unsafe extern "system" fn on_popup(hwnd: HWND, data: LPARAM) -> i32 {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GWL_STYLE, WS_POPUP};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
     let (front, pid, list) = &mut *(data as *mut (HWND, u32, Vec<HWND>));
-    if hwnd != *front && IsWindowVisible(hwnd) != 0 && (GetWindowLongW(hwnd, GWL_STYLE) as u32) & WS_POPUP != 0 {
+    if hwnd != *front && IsWindowVisible(hwnd) != 0 && GetWindowTextLengthW(hwnd) == 0 {
         let mut p = 0u32;
         GetWindowThreadProcessId(hwnd, &mut p);
         let mut r: RECT = std::mem::zeroed();
         windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r);
-        // Небольшое окно той же программы без заголовка — выпадающий список, меню, подсказка ввода.
-        if p == *pid && r.right - r.left > 8 && r.bottom - r.top > 8 && GetWindowTextLengthW(hwnd) == 0 {
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(hwnd, class.as_mut_ptr(), 64).max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        // Окно той же программы без заголовка поверх (выпадающий список, меню, подсказка ввода) — не тени Office.
+        if p == *pid && r.right - r.left > 12 && r.bottom - r.top > 12 && !class.contains("BORDEREFFECT") && !class.contains("Shadow") {
             list.push(hwnd);
         }
     }
@@ -613,7 +616,9 @@ fn click(args: &Value, down: u32, up: u32, times: usize) -> Out {
         (x, y, format!(" {name}"))
     } else {
         let (x, y) = point(args, "coordinate")?;
-        (x, y, String::new())
+        // Во что попадёт щелчок — до него (после него список мог перестроиться).
+        let hit = crate::ui::at(x, y).map(|h| format!(" on {h}")).unwrap_or_default();
+        (x, y, hit)
     };
     allow_at(args, x, y)?;
     // Одиночный щелчок сразу после другого в ту же точку Windows посчитал бы двойным (и открыл бы файл) — выждать.
@@ -739,7 +744,23 @@ fn list_windows(args: &Value) -> Out {
 /// или папку (Проводник). Путь — только существующий, без символов командной строки; Проводнику — только папка (файл он
 /// запустил бы), терминалам и браузерам путь не передаём.
 fn open_application(args: &Value) -> Out {
-    let name = canon(args["name"].as_str().unwrap_or(""));
+    let mut name = canon(args["name"].as_str().unwrap_or(""));
+    // Только путь — программа по нему: папка — Проводник, файл — по расширению.
+    if name.is_empty() {
+        if let Some(p) = args["path"].as_str().map(str::trim).filter(|p| !p.is_empty()) {
+            let ext = std::path::Path::new(p).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            name = match ext.as_str() {
+                _ if std::path::Path::new(p).is_dir() => "explorer",
+                "txt" | "log" | "ini" | "csv" | "md" => "notepad",
+                "doc" | "docx" | "rtf" => "winword",
+                "xls" | "xlsx" | "xlsm" => "excel",
+                "ppt" | "pptx" => "powerpnt",
+                "png" | "jpg" | "jpeg" | "bmp" | "gif" => "mspaint",
+                _ => "",
+            }
+            .to_string();
+        }
+    }
     if name.is_empty() || name.contains(['/', '\\', '"', '&', '|', '>', '<', '^', '%', ' ']) {
         return Err("name must be a plain application name like «notepad» or «excel»".into());
     }
@@ -854,7 +875,38 @@ fn ui_act(args: &Value) -> Out {
         crate::ui::Act::SetValue(args["value"].as_str().ok_or("`value` — the text to put into the field")?)
     };
     let pid = owner(hwnd).0;
-    let done = crate::ui::act(&roots(hwnd), query, role, index, what, &|| popups(hwnd, pid).into_iter().map(|h| h as isize).collect())?;
+    let done = match crate::ui::act(&roots(hwnd), query, role, index, what, &|| popups(hwnd, pid).into_iter().map(|h| h as isize).collect()) {
+        // Список, где UI Automation выбор не держит (Office), — щелчком по нему и по пункту, с теми же замками.
+        Err(e) if e.starts_with("CLICKLIST:") => {
+            let (xy, name) = e[10..].split_once(' ').unwrap_or((&e[10..], ""));
+            let n: Vec<i32> = xy.split(',').filter_map(|v| v.parse().ok()).collect();
+            let [x, y, idx] = n[..] else { return Err("bad list point".into()) };
+            allow_at(args, x, y)?;
+            move_to(x, y);
+            mouse(MOUSEEVENTF_LEFTDOWN, 0);
+            pause(25);
+            mouse(MOUSEEVENTF_LEFTUP, 0);
+            pause(400);
+            // Список мог быть «раскрыт» невидимо после UI Automation — тогда щелчок его закрыл: щёлкнуть ещё раз.
+            if popups(hwnd, pid).is_empty() {
+                mouse(MOUSEEVENTF_LEFTDOWN, 0);
+                pause(25);
+                mouse(MOUSEEVENTF_LEFTUP, 0);
+                pause(400);
+            }
+            // Пункты такого списка (Office) не дают координат — выбор с клавиатуры: к первому, вниз до нужного, Enter.
+            self::press(&[(0x24, true)], Duration::from_millis(20));
+            for _ in 0..idx {
+                pause(40);
+                self::press(&[(0x28, true)], Duration::from_millis(20));
+            }
+            pause(60);
+            self::press(&[(0x0D, false)], Duration::from_millis(20));
+            pause(250);
+            format!("option «{name}» picked (clicked the list, then the option)")
+        }
+        other => other?,
+    };
     ok(format!("In {app} — «{title}»: {done}"))
 }
 

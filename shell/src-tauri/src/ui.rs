@@ -182,6 +182,13 @@ fn value_of(e: &UIElement) -> Option<String> {
 }
 
 /// Выбрать пункт выпадающего списка по тексту: раскрыть, найти пункт (в самом списке или в его окне-попапе), выбрать.
+/// Текст выбранного в списке: Value, а если его нет — имя выбранного пункта.
+fn shown_value(e: &UIElement) -> String {
+    value_of(e).unwrap_or_default().trim().to_string()
+}
+
+/// Выбрать пункт выпадающего списка по тексту: раскрыть, найти пункт (в самом списке или в его окне-попапе), выбрать
+/// и проверить, что список его показывает. Не взялось — Err("CLICK:x,y …"): программа щёлкнет пункт мышью.
 fn pick(ua: &UIAutomation, e: &UIElement, value: &str, popups: &dyn Fn() -> Vec<isize>) -> Result<&'static str, String> {
     use uiautomation::patterns::{UIExpandCollapsePattern, UIInvokePattern, UISelectionItemPattern};
     let walker = ua.get_control_view_walker().map_err(|e| e.to_string())?;
@@ -196,26 +203,44 @@ fn pick(ua: &UIAutomation, e: &UIElement, value: &str, popups: &dyn Fn() -> Vec<
             roots.push(r);
         }
     }
+    let want = value.trim().to_lowercase();
+    let mut options: Vec<String> = Vec::new();
     for root in &roots {
-        let items = matching(&walker, root, value, None);
-        let item = items.iter().find(|(_, k, n)| matches!(k, ControlType::ListItem | ControlType::MenuItem | ControlType::DataItem)
-            && n.to_lowercase() == value.trim().to_lowercase()).or_else(|| items.iter().find(|(_, k, _)| matches!(k, ControlType::ListItem | ControlType::MenuItem)));
-        if let Some((it, _, _)) = item {
-            let done = it.get_pattern::<UISelectionItemPattern>().map(|p| p.select().is_ok()).unwrap_or(false)
-                || it.get_pattern::<UIInvokePattern>().map(|p| p.invoke().is_ok()).unwrap_or(false);
-            if done {
-                std::thread::sleep(Duration::from_millis(150));
-                if let Some(x) = &expand {
-                    let _ = x.collapse();
-                }
+        // Все пункты списка — и для выбора, и чтобы назвать их, если нужного нет.
+        let items: Vec<(UIElement, ControlType, String)> = matching(&walker, root, "", None)
+            .into_iter()
+            .filter(|(_, k, _)| matches!(k, ControlType::ListItem | ControlType::MenuItem))
+            .collect();
+        for (_, _, n) in &items {
+            if !options.contains(n) && options.len() < 30 {
+                options.push(n.clone());
+            }
+        }
+        let item = items.iter().find(|(_, _, n)| n.to_lowercase() == want).or_else(|| items.iter().find(|(_, _, n)| n.to_lowercase().contains(&want)));
+        if let Some((it, _, name)) = item {
+            let _ = it.get_pattern::<UISelectionItemPattern>().map(|p| p.select()).ok()
+                .or_else(|| it.get_pattern::<UIInvokePattern>().map(|p| p.invoke()).ok());
+            std::thread::sleep(Duration::from_millis(150));
+            // Проверять после того, как список закрыт: Office откатывает выбор, сделанный не мышью.
+            if let Some(x) = &expand {
+                let _ = x.collapse();
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            if shown_value(e).to_lowercase() == name.to_lowercase() {
                 return Ok("option selected");
+            }
+            // Не взялось — программа откроет список щелчком по нему и щёлкнет пункт (как человек).
+            if let Ok(r) = e.get_bounding_rectangle() {
+                let idx = items.iter().position(|(_, _, n)| n == name).unwrap_or(0);
+                return Err(format!("CLICKLIST:{},{},{idx} {name}", r.get_left() + r.get_width() / 2, r.get_top() + r.get_height() / 2));
             }
         }
     }
     if let Some(x) = &expand {
         let _ = x.collapse();
     }
-    Err(format!("no option «{}» in this list — open it with a click and pick from the listed items", value.trim()))
+    let list = if options.is_empty() { String::new() } else { format!(" — the options are: «{}»", options.join("», «")) };
+    Err(format!("no option «{}» in this list{list}", value.trim()))
 }
 
 fn set_value(ua: &UIAutomation, e: &UIElement, kind: ControlType, value: &str, popups: &dyn Fn() -> Vec<isize>) -> Result<&'static str, String> {
@@ -338,7 +363,8 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
     let root = ua.element_from_handle(Handle::from(hwnd)).map_err(|e| format!("the window cannot be read: {e}"))?;
     let walker = ua.get_control_view_walker().map_err(|e| e.to_string())?;
     let started = Instant::now();
-    let (mut acts, mut texts): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    // Содержимое (поля, ячейки, пункты списков, флажки) — отдельно от кнопок и меню: в Office лента иначе съедает весь список.
+    let (mut content, mut acts, mut texts): (Vec<String>, Vec<String>, Vec<String>) = (Vec::new(), Vec::new(), Vec::new());
     let mut seen = std::collections::HashSet::new();
     let mut cut = false;
     let mut stack = vec![(root, 0usize)];
@@ -347,7 +373,7 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
             cut = true;
             break;
         }
-        if acts.len() >= limit {
+        if acts.len() + content.len() >= limit * 3 {
             cut = true;
             break;
         }
@@ -369,7 +395,9 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
                             let empty_cell = kind == ControlType::DataItem && st.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric());
                             line.push_str(&st);
                             if !empty_cell && seen.insert(line.clone()) {
-                                if act { acts.push(line) } else { texts.push(line) }
+                                let is_content = matches!(kind, ControlType::Edit | ControlType::ComboBox | ControlType::Document | ControlType::DataItem
+                                    | ControlType::ListItem | ControlType::TreeItem | ControlType::CheckBox | ControlType::RadioButton | ControlType::Slider | ControlType::Spinner);
+                                if !act { texts.push(line) } else if is_content { content.push(line) } else { acts.push(line) }
                             }
                         }
                     }
@@ -389,10 +417,14 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
             }
         }
     }
-    let room = limit.saturating_sub(acts.len()).max(12);
-    let shown_texts = texts.len().min(room);
-    let mut out = acts;
-    out.extend(texts.into_iter().take(shown_texts));
+    let total = content.len() + acts.len();
+    let content_room = content.len().min(limit * 2 / 3).max(limit.saturating_sub(acts.len()));
+    let mut out: Vec<String> = content.iter().take(content_room).cloned().collect();
+    let acts_room = limit.saturating_sub(out.len());
+    out.extend(acts.iter().take(acts_room).cloned());
+    cut = cut || out.len() < total;
+    let room = limit.saturating_sub(out.len()).max(12);
+    out.extend(texts.into_iter().take(room));
     if cut {
         out.push("… (more elements: ui_find with a word from the one you need)".into());
     }
@@ -406,6 +438,29 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
         })
         .unwrap_or_default();
     Ok((out.join("\n"), focus))
+}
+
+/// Что под точкой рабочего стола: «listitem «a.txt»» — чтобы модель видела, во что попал щелчок по координатам.
+pub fn at(x: i32, y: i32) -> Option<String> {
+    let ua = automation().ok()?;
+    let e = ua.element_from_point(uiautomation::types::Point::new(x, y)).ok()?;
+    let kind = e.get_control_type().unwrap_or(ControlType::Custom);
+    let name: String = e.get_name().unwrap_or_default().trim().replace('\n', " ").chars().take(60).collect();
+    // Безымянная рамка или текст внутри пункта — назвать пункт: подняться до именованного родителя.
+    if name.is_empty() || kind == ControlType::Text {
+        let walker = ua.get_control_view_walker().ok()?;
+        let mut cur = e.clone();
+        for _ in 0..3 {
+            let Ok(p) = walker.get_parent(&cur) else { break };
+            let pk = p.get_control_type().unwrap_or(ControlType::Custom);
+            let pn: String = p.get_name().unwrap_or_default().trim().chars().take(60).collect();
+            if !pn.is_empty() && ACTIONABLE.contains(&pk) {
+                return Some(format!("{} «{pn}»", role(pk)));
+            }
+            cur = p;
+        }
+    }
+    (!name.is_empty()).then(|| format!("{} «{name}»", role(kind)))
 }
 
 fn automation() -> Result<UIAutomation, String> {
