@@ -508,11 +508,36 @@ fn inside(root: &str, rel: &str) -> Result<(PathBuf, PathBuf), String> {
     if rel_path.is_absolute() || rel.contains(':') || rel_path.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_) | Component::RootDir)) {
         return Err("the path must be relative to the folder, without «..»".into());
     }
-    let full = fs::canonicalize(base.join(rel_path)).map_err(|_| format!("no such file or directory: {rel}"))?;
+    let full = fs::canonicalize(base.join(rel_path)).map_err(|_| format!("no such file or directory: {rel}{}", near(&base.join(rel_path))))?;
     if !full.starts_with(&base) {
         return Err("the path leads outside the folder".into());
     }
     Ok((base, full))
+}
+
+/// Нет такого файла — похожие имена из той же папки (опечатка, двойной пробел, «ё» вместо «е»):
+/// иначе модель тратит ещё круг на list, чтобы узнать точное имя.
+fn near(missing: &Path) -> String {
+    let (Some(parent), Some(name)) = (missing.parent(), missing.file_name()) else { return String::new() };
+    let Ok(entries) = fs::read_dir(parent) else { return String::new() };
+    let key = |s: &str| s.to_lowercase().replace('ё', "е").chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+    let want = key(&name.to_string_lossy());
+    let mut names: Vec<(usize, String)> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .map(|n| {
+            let k = key(&n);
+            let common = k.chars().zip(want.chars()).take_while(|(a, b)| a == b).count();
+            (if k == want { usize::MAX } else { common }, n)
+        })
+        .filter(|(score, _)| *score >= 4)
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    names.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let list: Vec<String> = names.into_iter().take(5).map(|(_, n)| format!("«{n}»")).collect();
+    format!(". In that folder there is: {}", list.join(", "))
 }
 
 fn shown(base: &Path, p: &Path) -> String {
@@ -759,12 +784,17 @@ fn glob(root: &str, args: &Value) -> Result<Value, String> {
     if pattern.is_empty() {
         return Err("pattern is required".into());
     }
+    // Постоянное начало шаблона («Users/Artem/Desktop/…/Литература/*») — сразу папкой обхода: иначе при папке C:\
+    // обход шёл бы по всему диску и за 20 с не добирался до нужного места («No files match»).
+    let (dir, pattern) = narrow(&dir, pattern);
     let mut walk = walker(&dir, None, args["include_ignored"].as_bool().unwrap_or(false));
-    walk.overrides(overrides(&dir, pattern)?);
+    walk.overrides(overrides(&dir, &pattern)?);
     let started = Instant::now();
     let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let mut cut = false;
     for entry in walk.build().flatten() {
         if started.elapsed() > Duration::from_secs(20) {
+            cut = true;
             break;
         }
         if entry.file_type().map(|t| t.is_file()).unwrap_or(false) && !secret(entry.path()) {
@@ -773,11 +803,28 @@ fn glob(root: &str, args: &Value) -> Result<Value, String> {
     }
     found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let total = found.len();
+    let stopped = if cut { "\nThe search stopped after 20 s before covering the whole folder — pass a narrower path or a pattern that starts with the subfolder." } else { "" };
     if total == 0 {
-        return Ok(json!({ "ok": true, "text": "No files match.", "meta": { "count": 0 } }));
+        let none = if cut { "Nothing found within 20 s, but the search did not cover the whole folder — pass a narrower path." } else { "No files match." };
+        return Ok(json!({ "ok": true, "text": none, "meta": { "count": 0, "cut": cut } }));
     }
     let (text, _) = page(found.into_iter().map(|f| f.1).collect(), args, 100, "files");
-    Ok(json!({ "ok": true, "text": text, "meta": { "count": total } }))
+    Ok(json!({ "ok": true, "text": format!("{text}{stopped}"), "meta": { "count": total, "cut": cut } }))
+}
+
+/// Ведущие части шаблона без `* ? [ {`, что есть папками, — к папке обхода; остаток — сам шаблон.
+fn narrow(dir: &Path, pattern: &str) -> (PathBuf, String) {
+    let parts: Vec<&str> = pattern.trim_start_matches("./").split('/').filter(|p| !p.is_empty()).collect();
+    let mut at = dir.to_path_buf();
+    let mut used = 0;
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        if part.contains(['*', '?', '[', '{']) || *part == ".." || !at.join(part).is_dir() {
+            break;
+        }
+        at.push(part);
+        used += 1;
+    }
+    (at, parts[used..].join("/"))
 }
 
 /// Grep: ripgrep-подобный поиск — files_with_matches (по умолчанию), content, count_matches.
@@ -1115,6 +1162,22 @@ mod tests {
         fs::write(crate::home().join("code.json"), r#"{"device_id":null,"token":null,"roots":[]}"#).unwrap();
         code.heal();
         assert_eq!(Code::load().token().as_deref(), Some("fzd_test"));
+    }
+
+    #[test]
+    fn a_deep_glob_starts_from_its_folder_and_a_typo_gets_close_names() {
+        let d = tmp();
+        let lit = d.join("Users").join("Артём").join("Литература");
+        fs::create_dir_all(&lit).unwrap();
+        fs::write(lit.join("Сборка  узлов 2.pdf"), "x").unwrap();
+        let root = d.to_string_lossy().to_string();
+        let r = glob(&root, &json!({ "pattern": "Users/Артём/Литература/*.pdf" })).unwrap();
+        assert!(r["text"].as_str().unwrap().contains("Сборка  узлов 2.pdf"), "{r}");
+        let (at, rest) = narrow(&d, "Users/Артём/Литература/*.pdf");
+        assert_eq!((at, rest.as_str()), (lit.clone(), "*.pdf"));
+        let err = inside(&root, "Users/Артём/Литература/Сборка узлов 2.pdf").unwrap_err();
+        assert!(err.contains("«Сборка  узлов 2.pdf»"), "{err}");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
