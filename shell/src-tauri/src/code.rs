@@ -26,7 +26,7 @@ const MAX_SEARCH_FILE: u64 = 2 * 1024 * 1024;
 const MAX_LINE: usize = 2000;
 const LIST_LIMIT: usize = 600;
 
-fn site() -> String {
+pub fn site() -> String {
     std::env::var("FIZMAT_SITE").unwrap_or_else(|_| "https://fizmat.ai".into())
 }
 
@@ -297,7 +297,12 @@ pub fn start(app: AppHandle) {
                 .call();
             match res {
                 Ok(r) => {
-                    let calls = r.into_json::<Value>().ok().and_then(|v| v["calls"].as_array().cloned()).unwrap_or_default();
+                    let body = r.into_json::<Value>().unwrap_or_default();
+                    // Уведомления сайта для этого компьютера — уведомлениями Windows (notice.rs).
+                    if let Some(news) = body["news"].as_array().filter(|n| !n.is_empty()) {
+                        crate::notice::show(&app, news);
+                    }
+                    let calls = body["calls"].as_array().cloned().unwrap_or_default();
                     if !calls.is_empty() {
                         last_call = Instant::now();
                     }

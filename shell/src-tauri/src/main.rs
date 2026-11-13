@@ -14,6 +14,7 @@ mod code;
 #[cfg(windows)]
 mod computer;
 mod glass;
+mod notice;
 mod settings;
 mod shell;
 #[cfg(windows)]
