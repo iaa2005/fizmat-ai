@@ -224,7 +224,7 @@ fn screenshot(args: &Value) -> Out {
         let (x0, y0) = (((r.left - v.x) as f64 / v.scale).round() as i32, ((r.top - v.y) as f64 / v.scale).round() as i32);
         let (x1, y1) = (((r.right - v.x) as f64 / v.scale).round() as i32, ((r.bottom - v.y) as f64 / v.scale).round() as i32);
         if x1 > 0 && y1 > 0 && x0 < nw && y0 < nh {
-            let t = format!(" The Fizmat window sits on top at ({x0},{y0})–({x1},{y1}) and is cut out of the picture: clicks there are refused, so move a window that is under it or work outside it.");
+            let t = format!(" The Fizmat window sits on top at ({x0},{y0})–({x1},{y1}) and is cut out of the picture; a click there moves it to the other corner first.");
             out["text"] = Value::String(format!("{}{t}", out["text"].as_str().unwrap_or("")));
         }
     }
@@ -486,7 +486,8 @@ pub fn display() -> Option<RECT> {
 }
 
 fn allow_at(args: &Value, x: i32, y: i32) -> Result<(), String> {
-    if crate::veil::covers(x, y) {
+    // Под окном Fizmat — сначала отодвинуть его в другой угол.
+    if crate::veil::covers(x, y) && !crate::veil::dodge(x, y) {
         return Err("this spot is under the Fizmat window: while you control the computer it sits in the bottom-right corner on top of other windows and is hidden from screenshots. Move the target window or use another spot".into());
     }
     let hwnd = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };

@@ -216,6 +216,27 @@ pub fn covers(x: i32, y: i32) -> bool {
     corner().map(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom).unwrap_or(false)
 }
 
+/// Щелчок модели пришёлся под окно Fizmat — переставить его в другой нижний угол экрана. true — точка теперь свободна.
+pub fn dodge(x: i32, y: i32) -> bool {
+    let Some(r) = corner() else { return true };
+    let h = { SESSION.lock().unwrap().as_ref().and_then(|s| s.main).map(|(h, _, _)| h) };
+    let Some(h) = h else { return true };
+    unsafe {
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mut info) == 0 {
+            return false;
+        }
+        let area = info.rcWork;
+        let (w, hgt) = (r.right - r.left, r.bottom - r.top);
+        let gap = (GAP * (w as f64 / CORNER.0).max(1.0)) as i32;
+        let left = if r.left - area.left > area.right - r.right { area.left + gap } else { area.right - gap - w };
+        SetWindowPos(h as HWND, HWND_TOPMOST, left, area.bottom - gap - hgt, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
+    std::thread::sleep(Duration::from_millis(120));
+    !covers(x, y)
+}
+
 /// Где на рабочем столе стоит окно Fizmat, пока модель управляет компьютером.
 pub fn corner() -> Option<RECT> {
     let s = SESSION.lock().unwrap();
