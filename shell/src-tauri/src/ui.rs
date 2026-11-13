@@ -175,32 +175,93 @@ fn press(e: &UIElement) -> Result<&'static str, String> {
     Err("this element cannot be pressed through UI Automation — click it at its coordinates instead".into())
 }
 
-fn set_value(e: &UIElement, value: &str) -> Result<&'static str, String> {
+/// Значение поля сейчас (Value pattern) — для проверки, что вписалось.
+fn value_of(e: &UIElement) -> Option<String> {
+    use uiautomation::patterns::UIValuePattern;
+    e.get_pattern::<UIValuePattern>().ok().and_then(|p| p.get_value().ok())
+}
+
+/// Выбрать пункт выпадающего списка по тексту: раскрыть, найти пункт (в самом списке или в его окне-попапе), выбрать.
+fn pick(ua: &UIAutomation, e: &UIElement, value: &str, popups: &dyn Fn() -> Vec<isize>) -> Result<&'static str, String> {
+    use uiautomation::patterns::{UIExpandCollapsePattern, UIInvokePattern, UISelectionItemPattern};
+    let walker = ua.get_control_view_walker().map_err(|e| e.to_string())?;
+    let expand = e.get_pattern::<UIExpandCollapsePattern>().ok();
+    if let Some(x) = &expand {
+        let _ = x.expand();
+        std::thread::sleep(Duration::from_millis(350));
+    }
+    let mut roots = vec![e.clone()];
+    for h in popups() {
+        if let Ok(r) = ua.element_from_handle(Handle::from(h)) {
+            roots.push(r);
+        }
+    }
+    for root in &roots {
+        let items = matching(&walker, root, value, None);
+        let item = items.iter().find(|(_, k, n)| matches!(k, ControlType::ListItem | ControlType::MenuItem | ControlType::DataItem)
+            && n.to_lowercase() == value.trim().to_lowercase()).or_else(|| items.iter().find(|(_, k, _)| matches!(k, ControlType::ListItem | ControlType::MenuItem)));
+        if let Some((it, _, _)) = item {
+            let done = it.get_pattern::<UISelectionItemPattern>().map(|p| p.select().is_ok()).unwrap_or(false)
+                || it.get_pattern::<UIInvokePattern>().map(|p| p.invoke().is_ok()).unwrap_or(false);
+            if done {
+                std::thread::sleep(Duration::from_millis(150));
+                if let Some(x) = &expand {
+                    let _ = x.collapse();
+                }
+                return Ok("option selected");
+            }
+        }
+    }
+    if let Some(x) = &expand {
+        let _ = x.collapse();
+    }
+    Err(format!("no option «{}» in this list — open it with a click and pick from the listed items", value.trim()))
+}
+
+fn set_value(ua: &UIAutomation, e: &UIElement, kind: ControlType, value: &str, popups: &dyn Fn() -> Vec<isize>) -> Result<&'static str, String> {
     use uiautomation::patterns::{UILegacyIAccessiblePattern, UIValuePattern};
+    // Выпадающий список (у Office он не берёт Value) — выбором пункта.
+    if kind == ControlType::ComboBox {
+        let editable = e.get_pattern::<UIValuePattern>().map(|p| !p.is_readonly().unwrap_or(true)).unwrap_or(false);
+        if !editable {
+            return pick(ua, e, value, popups);
+        }
+    }
+    let took = |e: &UIElement| value_of(e).map(|v| v.trim() == value.trim()).unwrap_or(true);
     if let Ok(p) = e.get_pattern::<UIValuePattern>() {
         if p.is_readonly().unwrap_or(false) {
             return Err("this field is read-only".into());
         }
-        if p.set_value(value).is_ok() {
+        if p.set_value(value).is_ok() && took(e) {
             return Ok("value set");
         }
     }
     if let Ok(p) = e.get_pattern::<UILegacyIAccessiblePattern>() {
-        if p.set_value(value).is_ok() {
+        if p.set_value(value).is_ok() && took(e) {
             return Ok("value set");
         }
     }
-    Err("this element takes no value through UI Automation — click into it and use type instead".into())
+    if kind == ControlType::ComboBox {
+        return pick(ua, e, value, popups);
+    }
+    Err("this field did not take the value through UI Automation — click into it, press ctrl+a and use type".into())
 }
 
-/// Нажать элемент или вписать значение. index — какое из совпадений (с 1), по умолчанию первое.
-pub fn act(hwnd: isize, query: &str, role_filter: Option<&str>, index: usize, what: Act) -> Result<String, String> {
+/// Нажать элемент или вписать значение. roots — где искать по порядку (открытые попапы, потом окно); index — какое из совпадений.
+pub fn act(roots: &[isize], query: &str, role_filter: Option<&str>, index: usize, what: Act, popups: &dyn Fn() -> Vec<isize>) -> Result<String, String> {
     let ua = automation()?;
-    let root = ua.element_from_handle(Handle::from(hwnd)).map_err(|e| format!("the window cannot be read: {e}"))?;
     let walker = ua.get_control_view_walker().map_err(|e| e.to_string())?;
-    let found = matching(&walker, &root, query, role_filter);
+    let mut found = Vec::new();
+    for h in roots {
+        if let Ok(root) = ua.element_from_handle(Handle::from(*h)) {
+            found = matching(&walker, &root, query, role_filter);
+            if !found.is_empty() {
+                break;
+            }
+        }
+    }
     if found.is_empty() {
-        return Err(format!("no element named like «{}» in this window — look with ui_find or ui_tree", query.trim()));
+        return Err(format!("no element named like «{}» in this window — look at the element list of a fresh screenshot", query.trim()));
     }
     let n = found.len();
     let (e, kind, name) = found.into_iter().nth(index.max(1) - 1).ok_or_else(|| format!("only {n} elements match «{}»", query.trim()))?;
@@ -209,21 +270,28 @@ pub fn act(hwnd: isize, query: &str, role_filter: Option<&str>, index: usize, wh
     }
     let done = match what {
         Act::Press => press(&e)?,
-        Act::SetValue(v) => set_value(&e, v)?,
+        Act::SetValue(v) => set_value(&ua, &e, kind, v, popups)?,
     };
     let more = if n > 1 { format!(" ({n} elements matched; this was #{}; pass index for another)", index.max(1)) } else { String::new() };
-    Ok(format!("{} «{name}»: {done}.{more} Take a screenshot or read the tree to see the result.", role(kind)))
+    Ok(format!("{} «{name}»: {done}.{more}", role(kind)))
 }
 
 /// Центр элемента с названием query на рабочем столе — чтобы щёлкнуть его мышью (left_click с `text`).
-pub fn locate(hwnd: isize, query: &str, role_filter: Option<&str>, index: usize) -> Result<(i32, i32, String), String> {
+pub fn locate(roots: &[isize], query: &str, role_filter: Option<&str>, index: usize) -> Result<(i32, i32, String), String> {
     let ua = automation()?;
-    let root = ua.element_from_handle(Handle::from(hwnd)).map_err(|e| format!("the window cannot be read: {e}"))?;
     let walker = ua.get_control_view_walker().map_err(|e| e.to_string())?;
-    let found: Vec<_> = matching(&walker, &root, query, role_filter)
-        .into_iter()
-        .filter(|(e, _, _)| !e.is_offscreen().unwrap_or(false) && e.get_bounding_rectangle().map(|r| r.get_width() > 0 && r.get_height() > 0).unwrap_or(false))
-        .collect();
+    let mut found = Vec::new();
+    for h in roots {
+        if let Ok(root) = ua.element_from_handle(Handle::from(*h)) {
+            found = matching(&walker, &root, query, role_filter)
+                .into_iter()
+                .filter(|(e, _, _)| !e.is_offscreen().unwrap_or(false) && e.get_bounding_rectangle().map(|r| r.get_width() > 0 && r.get_height() > 0).unwrap_or(false))
+                .collect();
+            if !found.is_empty() {
+                break;
+            }
+        }
+    }
     if found.is_empty() {
         return Err(format!("no visible element named like «{}» in this window — look at the element list of a fresh screenshot", query.trim()));
     }
@@ -241,6 +309,29 @@ const ACTIONABLE: [ControlType; 16] = [
     ControlType::TabItem, ControlType::Hyperlink, ControlType::ListItem, ControlType::TreeItem, ControlType::SplitButton, ControlType::DataItem,
     ControlType::Document, ControlType::Slider, ControlType::Spinner, ControlType::HeaderItem,
 ];
+
+/// Что в элементе сейчас: текст поля (чтобы не разглядывать мелкий шрифт на снимке), флажок вкл/выкл.
+fn state(e: &UIElement, kind: ControlType) -> String {
+    use uiautomation::patterns::{UITogglePattern, UIValuePattern};
+    match kind {
+        ControlType::Edit | ControlType::ComboBox | ControlType::Document | ControlType::DataItem | ControlType::ListItem => {
+            let Ok(p) = e.get_pattern::<UIValuePattern>() else { return String::new() };
+            let v = p.get_value().unwrap_or_default();
+            if v.is_empty() && matches!(kind, ControlType::DataItem | ControlType::ListItem) {
+                return String::new();
+            }
+            let max = if kind == ControlType::Document || v.contains('\n') { 400 } else { 120 };
+            let short: String = v.chars().take(max).collect::<String>().replace('\r', "").replace('\n', "⏎");
+            let more = if v.chars().count() > max { format!("… ({} chars)", v.chars().count()) } else { String::new() };
+            format!(" = \"{short}{more}\"")
+        }
+        ControlType::CheckBox | ControlType::RadioButton => match e.get_pattern::<UITogglePattern>().and_then(|p| p.get_toggle_state()) {
+            Ok(s) => format!(" [{}]", if format!("{s:?}").to_lowercase() == "on" { "on" } else { "off" }),
+            Err(_) => String::new(),
+        },
+        _ => String::new(),
+    }
+}
 
 pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limit: usize, budget: Duration) -> Result<(String, String), String> {
     let ua = automation()?;
@@ -273,7 +364,11 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
                             if !e.is_enabled().unwrap_or(true) {
                                 line.push_str(" disabled");
                             }
-                            if seen.insert(line.clone()) {
+                            let st = state(&e, kind);
+                            // Пустая ячейка таблицы («B7») — не в список: их на экране сотни.
+                            let empty_cell = kind == ControlType::DataItem && st.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric());
+                            line.push_str(&st);
+                            if !empty_cell && seen.insert(line.clone()) {
                                 if act { acts.push(line) } else { texts.push(line) }
                             }
                         }
@@ -306,7 +401,8 @@ pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limi
         .ok()
         .map(|f| {
             let name: String = f.get_name().unwrap_or_default().trim().chars().take(60).collect();
-            format!("{} «{name}»", role(f.get_control_type().unwrap_or(ControlType::Custom)))
+            let kind = f.get_control_type().unwrap_or(ControlType::Custom);
+            format!("{} «{name}»{}", role(kind), state(&f, kind))
         })
         .unwrap_or_default();
     Ok((out.join("\n"), focus))

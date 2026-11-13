@@ -54,6 +54,9 @@ struct View {
 
 static VIEW: Mutex<Option<View>> = Mutex::new(None);
 
+/// Последний щелчок: когда и где (на рабочем столе).
+static LAST_CLICK: Mutex<Option<(std::time::Instant, i32, i32)>> = Mutex::new(None);
+
 type Out = Result<Value, String>;
 
 fn ok(text: impl Into<String>) -> Out {
@@ -247,13 +250,59 @@ fn elements(v: &View) -> String {
         (x >= v.x && y >= v.y && x < v.x + v.w && y < v.y + v.h)
             .then(|| ((((x - v.x) as f64) / v.scale).round() as i32, (((y - v.y) as f64) / v.scale).round() as i32))
     };
+    // Раскрытые списки, меню и подсказки той же программы — отдельные окна-попапы поверх: их пункты — первыми.
+    let mut text = String::new();
+    let mut shown = 0;
+    for popup in popups(hwnd, pid).into_iter().take(8) {
+        if shown >= 2 {
+            break;
+        }
+        if let Ok((list, _)) = crate::ui::brief(popup as isize, &to_shot, 40, Duration::from_millis(400)) {
+            if !list.is_empty() {
+                shown += 1;
+                text.push_str(&format!("\nOpen popup (list or menu) of {app} — its items:\n{list}"));
+            }
+        }
+    }
     match crate::ui::brief(hwnd as isize, &to_shot, 70, Duration::from_millis(1500)) {
         Ok((list, focus)) if !list.is_empty() => {
             let focus = if focus.is_empty() { String::new() } else { format!(" Keyboard focus: {focus}.") };
-            format!("\nElements of the front window ({app}) with their centres in this screenshot's pixels — click these exact points:{focus}\n{list}")
+            text.push_str(&format!("\nElements of the front window ({app}) with their centres in this screenshot's pixels — click these exact points:{focus}\n{list}"));
         }
-        _ => String::new(),
+        _ => {}
     }
+    text
+}
+
+unsafe extern "system" fn on_popup(hwnd: HWND, data: LPARAM) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GWL_STYLE, WS_POPUP};
+    let (front, pid, list) = &mut *(data as *mut (HWND, u32, Vec<HWND>));
+    if hwnd != *front && IsWindowVisible(hwnd) != 0 && (GetWindowLongW(hwnd, GWL_STYLE) as u32) & WS_POPUP != 0 {
+        let mut p = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut p);
+        let mut r: RECT = std::mem::zeroed();
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r);
+        // Небольшое окно той же программы без заголовка — выпадающий список, меню, подсказка ввода.
+        if p == *pid && r.right - r.left > 8 && r.bottom - r.top > 8 && GetWindowTextLengthW(hwnd) == 0 {
+            list.push(hwnd);
+        }
+    }
+    1
+}
+
+/// Где искать элемент по названию: сначала открытые попапы программы (раскрытый список, меню), потом само окно.
+fn roots(hwnd: HWND) -> Vec<isize> {
+    let pid = owner(hwnd).0;
+    let mut list: Vec<isize> = popups(hwnd, pid).into_iter().map(|h| h as isize).collect();
+    list.push(hwnd as isize);
+    list
+}
+
+/// Видимые попапы программы окна (EnumWindows идёт сверху вниз — ближние к нам первыми).
+fn popups(front: HWND, pid: u32) -> Vec<HWND> {
+    let mut data: (HWND, u32, Vec<HWND>) = (front, pid, Vec::new());
+    unsafe { EnumWindows(Some(on_popup), &mut data as *mut _ as LPARAM) };
+    data.2
 }
 
 fn zoom(args: &Value) -> Out {
@@ -560,13 +609,24 @@ fn click(args: &Value, down: u32, up: u32, times: usize) -> Out {
     let (x, y, what) = if by_name {
         let (hwnd, _, _) = target(args)?;
         let index = args["index"].as_u64().unwrap_or(1).clamp(1, 50) as usize;
-        let (x, y, name) = crate::ui::locate(hwnd as isize, args["text"].as_str().unwrap_or(""), args["role"].as_str().filter(|s| !s.trim().is_empty()), index)?;
+        let (x, y, name) = crate::ui::locate(&roots(hwnd), args["text"].as_str().unwrap_or(""), args["role"].as_str().filter(|s| !s.trim().is_empty()), index)?;
         (x, y, format!(" {name}"))
     } else {
         let (x, y) = point(args, "coordinate")?;
         (x, y, String::new())
     };
     allow_at(args, x, y)?;
+    // Одиночный щелчок сразу после другого в ту же точку Windows посчитал бы двойным (и открыл бы файл) — выждать.
+    if times == 1 {
+        let wait = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() } as u128 + 60;
+        let last = *LAST_CLICK.lock().unwrap();
+        if let Some((t, px, py)) = last {
+            let gone = t.elapsed().as_millis();
+            if gone < wait && (px - x).abs() < 8 && (py - y).abs() < 8 {
+                pause((wait - gone) as u64);
+            }
+        }
+    }
     move_to(x, y);
     with_modifiers(args, || {
         for i in 0..times {
@@ -578,6 +638,7 @@ fn click(args: &Value, down: u32, up: u32, times: usize) -> Out {
             mouse(up, 0);
         }
     })?;
+    *LAST_CLICK.lock().unwrap() = Some((std::time::Instant::now(), x, y));
     pause(120);
     ok(format!("Clicked{what}."))
 }
@@ -599,7 +660,7 @@ fn type_text(args: &Value) -> Out {
                     key_event(0, *u, KEYEVENTF_UNICODE);
                     key_event(0, *u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
                 }
-                pause(6);
+                pause(18);
             }
         }
     }
@@ -792,11 +853,25 @@ fn ui_act(args: &Value) -> Out {
     } else {
         crate::ui::Act::SetValue(args["value"].as_str().ok_or("`value` — the text to put into the field")?)
     };
-    let done = crate::ui::act(hwnd as isize, query, role, index, what)?;
+    let pid = owner(hwnd).0;
+    let done = crate::ui::act(&roots(hwnd), query, role, index, what, &|| popups(hwnd, pid).into_iter().map(|h| h as isize).collect())?;
     ok(format!("In {app} — «{title}»: {done}"))
 }
 
 // ── Вход ─────────────────────────────────────────────────────────────────
+
+/// Если впереди окно самой Fizmat (пока модель работает, оно поверх всех), — вывести вперёд верхнее окно под ним.
+fn unfocus_self() {
+    let me = unsafe { GetCurrentProcessId() };
+    let Some((pid, _, _)) = front() else { return };
+    if pid != me {
+        return;
+    }
+    if let Some((hwnd, _, _)) = windows().into_iter().find(|(h, app, t)| owner(*h).0 != me && unsafe { IsIconic(*h) } == 0 && !(app == "explorer" && t == "Program Manager")) {
+        unsafe { SetForegroundWindow(hwnd) };
+        pause(150);
+    }
+}
 
 fn one(args: &Value) -> Out {
     let action = args["action"].as_str().unwrap_or("");
@@ -806,6 +881,8 @@ fn one(args: &Value) -> Out {
     if input && locked() {
         return Err(LOCKED.into());
     }
+    // Окно Fizmat стоит поверх всех; закрылся диалог — фокус проваливается в него. Отдать фокус окну под ним.
+    unfocus_self();
     let before = front().map(|(_, a, t)| (a, t));
     let out = act(action, args);
     // После действия, что меняет экран, — какое окно стало впереди (открылся диалог, фокус ушёл…).
@@ -813,6 +890,7 @@ fn one(args: &Value) -> Out {
     match out {
         Ok(mut v) if moves => {
             pause(150);
+            unfocus_self();
             let after = front().map(|(_, a, t)| (a, t));
             if after != before {
                 if let Some((app, title)) = after {
