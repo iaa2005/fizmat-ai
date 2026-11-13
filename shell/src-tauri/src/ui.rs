@@ -215,6 +215,103 @@ pub fn act(hwnd: isize, query: &str, role_filter: Option<&str>, index: usize, wh
     Ok(format!("{} «{name}»: {done}.{more} Take a screenshot or read the tree to see the result.", role(kind)))
 }
 
+/// Центр элемента с названием query на рабочем столе — чтобы щёлкнуть его мышью (left_click с `text`).
+pub fn locate(hwnd: isize, query: &str, role_filter: Option<&str>, index: usize) -> Result<(i32, i32, String), String> {
+    let ua = automation()?;
+    let root = ua.element_from_handle(Handle::from(hwnd)).map_err(|e| format!("the window cannot be read: {e}"))?;
+    let walker = ua.get_control_view_walker().map_err(|e| e.to_string())?;
+    let found: Vec<_> = matching(&walker, &root, query, role_filter)
+        .into_iter()
+        .filter(|(e, _, _)| !e.is_offscreen().unwrap_or(false) && e.get_bounding_rectangle().map(|r| r.get_width() > 0 && r.get_height() > 0).unwrap_or(false))
+        .collect();
+    if found.is_empty() {
+        return Err(format!("no visible element named like «{}» in this window — look at the element list of a fresh screenshot", query.trim()));
+    }
+    let n = found.len();
+    let (e, kind, name) = found.into_iter().nth(index.max(1) - 1).ok_or_else(|| format!("only {n} visible elements match «{}»", query.trim()))?;
+    let r = e.get_bounding_rectangle().map_err(|e| e.to_string())?;
+    let more = if n > 1 { format!(" ({n} matched; this was #{})", index.max(1)) } else { String::new() };
+    Ok((r.get_left() + r.get_width() / 2, r.get_top() + r.get_height() / 2, format!("{} «{name}»{more}", role(kind))))
+}
+
+/// Элементы, на которые можно действовать, — коротким списком к снимку экрана: сначала кнопки, поля, пункты,
+/// потом подписи (в них видно состояние: число в калькуляторе, текст статуса). Только видимые на показанном экране.
+const ACTIONABLE: [ControlType; 16] = [
+    ControlType::Button, ControlType::Edit, ControlType::CheckBox, ControlType::RadioButton, ControlType::ComboBox, ControlType::MenuItem,
+    ControlType::TabItem, ControlType::Hyperlink, ControlType::ListItem, ControlType::TreeItem, ControlType::SplitButton, ControlType::DataItem,
+    ControlType::Document, ControlType::Slider, ControlType::Spinner, ControlType::HeaderItem,
+];
+
+pub fn brief(hwnd: isize, to_shot: &dyn Fn(i32, i32) -> Option<(i32, i32)>, limit: usize, budget: Duration) -> Result<(String, String), String> {
+    let ua = automation()?;
+    let root = ua.element_from_handle(Handle::from(hwnd)).map_err(|e| format!("the window cannot be read: {e}"))?;
+    let walker = ua.get_control_view_walker().map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let (mut acts, mut texts): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut seen = std::collections::HashSet::new();
+    let mut cut = false;
+    let mut stack = vec![(root, 0usize)];
+    while let Some((e, depth)) = stack.pop() {
+        if started.elapsed() > budget {
+            cut = true;
+            break;
+        }
+        if acts.len() >= limit {
+            cut = true;
+            break;
+        }
+        let kind = e.get_control_type().unwrap_or(ControlType::Custom);
+        let offscreen = e.is_offscreen().unwrap_or(false);
+        let act = ACTIONABLE.contains(&kind);
+        if (act || kind == ControlType::Text) && !offscreen {
+            let name: String = e.get_name().unwrap_or_default().trim().replace('\n', " ").chars().take(80).collect();
+            if !name.is_empty() || matches!(kind, ControlType::Edit | ControlType::Document) {
+                if let Ok(r) = e.get_bounding_rectangle() {
+                    if r.get_width() > 0 && r.get_height() > 0 {
+                        if let Some((x, y)) = to_shot(r.get_left() + r.get_width() / 2, r.get_top() + r.get_height() / 2) {
+                            let mut line = format!("{} «{name}» ({x},{y})", role(kind));
+                            if !e.is_enabled().unwrap_or(true) {
+                                line.push_str(" disabled");
+                            }
+                            if seen.insert(line.clone()) {
+                                if act { acts.push(line) } else { texts.push(line) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Внутрь кнопок и пунктов не идём: там их же подписи.
+        if depth < MAX_DEPTH && !(act && !matches!(kind, ControlType::Document | ControlType::ListItem | ControlType::TreeItem | ControlType::DataItem)) {
+            let mut kids = Vec::new();
+            let mut child = walker.get_first_child(&e).ok();
+            while let Some(c) = child {
+                child = walker.get_next_sibling(&c).ok();
+                kids.push(c);
+            }
+            for c in kids.into_iter().rev() {
+                stack.push((c, depth + 1));
+            }
+        }
+    }
+    let room = limit.saturating_sub(acts.len()).max(12);
+    let shown_texts = texts.len().min(room);
+    let mut out = acts;
+    out.extend(texts.into_iter().take(shown_texts));
+    if cut {
+        out.push("… (more elements: ui_find with a word from the one you need)".into());
+    }
+    let focus = ua
+        .get_focused_element()
+        .ok()
+        .map(|f| {
+            let name: String = f.get_name().unwrap_or_default().trim().chars().take(60).collect();
+            format!("{} «{name}»", role(f.get_control_type().unwrap_or(ControlType::Custom)))
+        })
+        .unwrap_or_default();
+    Ok((out.join("\n"), focus))
+}
+
 fn automation() -> Result<UIAutomation, String> {
     UIAutomation::new().or_else(|_| UIAutomation::new_direct()).map_err(|e| format!("UI Automation is unavailable: {e}"))
 }

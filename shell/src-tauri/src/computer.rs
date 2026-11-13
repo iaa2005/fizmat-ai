@@ -206,7 +206,7 @@ pub fn locked() -> bool {
     front().map(|(_, app, _)| app == "lockapp" || app == "logonui").unwrap_or(false)
 }
 
-fn screenshot() -> Out {
+fn screenshot(args: &Value) -> Out {
     let v = view()?;
     if locked() {
         // Снимок экрана блокировки модели ничего не даст (а часто и не снимается вовсе).
@@ -215,8 +215,45 @@ fn screenshot() -> Out {
     let cursor = cursor().map(|(x, y)| format!(" The mouse is at ({x}, {y}).")).unwrap_or_default();
     let front = front().map(|(_, name, title)| format!(" Frontmost: {name} — «{title}».")).unwrap_or_default();
     let (nw, nh) = ((v.w as f64 / v.scale).round() as i32, (v.h as f64 / v.scale).round() as i32);
-    picture(v.x, v.y, v.w, v.h, v.scale, format!("Screenshot of display {} of {}, {nw}×{nh}; coordinates for clicks are in this image's pixels.{cursor}{front}",
-        v.display + 1, displays().len()))
+    let mut out = picture(v.x, v.y, v.w, v.h, v.scale, format!("Screenshot of display {} of {}, {nw}×{nh}; coordinates for clicks are in this image's pixels.{cursor}{front}",
+        v.display + 1, displays().len()))?;
+    if let Some(r) = crate::veil::corner() {
+        let (x0, y0) = (((r.left - v.x) as f64 / v.scale).round() as i32, ((r.top - v.y) as f64 / v.scale).round() as i32);
+        let (x1, y1) = (((r.right - v.x) as f64 / v.scale).round() as i32, ((r.bottom - v.y) as f64 / v.scale).round() as i32);
+        if x1 > 0 && y1 > 0 && x0 < nw && y0 < nh {
+            let t = format!(" The Fizmat window sits on top at ({x0},{y0})–({x1},{y1}) and is cut out of the picture: clicks there are refused, so move a window that is under it or work outside it.");
+            out["text"] = Value::String(format!("{}{t}", out["text"].as_str().unwrap_or("")));
+        }
+    }
+    if args["elements"] != false {
+        let list = elements(&v);
+        out["text"] = Value::String(format!("{}{list}", out["text"].as_str().unwrap_or("")));
+    }
+    Ok(out)
+}
+
+/// Элементы переднего окна к снимку: «роль «название» (x,y)» в пикселях снимка — щёлкать по ним, а не на глаз.
+fn elements(v: &View) -> String {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return String::new();
+    }
+    let (pid, app) = owner(hwnd);
+    if pid == unsafe { GetCurrentProcessId() } || app == "fizmat" || app == "fizmat-guard" {
+        return String::new();
+    }
+    let v = *v;
+    let to_shot = move |x: i32, y: i32| {
+        (x >= v.x && y >= v.y && x < v.x + v.w && y < v.y + v.h)
+            .then(|| ((((x - v.x) as f64) / v.scale).round() as i32, (((y - v.y) as f64) / v.scale).round() as i32))
+    };
+    match crate::ui::brief(hwnd as isize, &to_shot, 70, Duration::from_millis(1500)) {
+        Ok((list, focus)) if !list.is_empty() => {
+            let focus = if focus.is_empty() { String::new() } else { format!(" Keyboard focus: {focus}.") };
+            format!("\nElements of the front window ({app}) with their centres in this screenshot's pixels — click these exact points:{focus}\n{list}")
+        }
+        _ => String::new(),
+    }
 }
 
 fn zoom(args: &Value) -> Out {
@@ -257,8 +294,43 @@ fn cursor() -> Option<(i32, i32)> {
     Some((((p.x - v.x) as f64 / v.scale).round() as i32, ((p.y - v.y) as f64 / v.scale).round() as i32))
 }
 
-/// Программа окна: (pid, имя файла без .exe, строчными).
+/// Привычные имена → имя программы окна: модель и человек пишут «calculator», «word», «paint».
+pub fn canon(name: &str) -> String {
+    let n = name.trim().trim_end_matches(".exe").to_lowercase();
+    match n.as_str() {
+        "calc" | "calculator" | "калькулятор" => "calculatorapp".into(),
+        "word" | "msword" => "winword".into(),
+        "paint" | "pbrush" => "mspaint".into(),
+        "file explorer" | "проводник" => "explorer".into(),
+        "блокнот" => "notepad".into(),
+        _ => n,
+    }
+}
+
+unsafe extern "system" fn on_child(hwnd: HWND, data: LPARAM) -> i32 {
+    let (frame, found) = &mut *(data as *mut (u32, Option<(u32, String)>));
+    let (pid, name) = owner_raw(hwnd);
+    if pid != *frame && !name.is_empty() {
+        *found = Some((pid, name));
+        return 0;
+    }
+    1
+}
+
+/// Программа окна: (pid, имя файла без .exe, строчными). Окна UWP (рамка ApplicationFrameHost) — по программе внутри.
 fn owner(hwnd: HWND) -> (u32, String) {
+    let (pid, name) = owner_raw(hwnd);
+    if name == "applicationframehost" {
+        let mut data: (u32, Option<(u32, String)>) = (pid, None);
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::EnumChildWindows(hwnd, Some(on_child), &mut data as *mut _ as LPARAM) };
+        if let Some(inner) = data.1 {
+            return inner;
+        }
+    }
+    (pid, name)
+}
+
+fn owner_raw(hwnd: HWND) -> (u32, String) {
     unsafe {
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut pid);
@@ -333,7 +405,8 @@ fn tier(app: &str) -> &'static str {
 }
 
 fn granted(args: &Value, app: &str) -> bool {
-    args["apps"].as_array().map(|a| a.iter().any(|x| x.as_str().map(|s| s.to_lowercase()) == Some(app.to_string()))).unwrap_or(false)
+    let app = canon(app);
+    args["apps"].as_array().map(|a| a.iter().any(|x| x.as_str().map(canon).as_deref() == Some(app.as_str()))).unwrap_or(false)
 }
 
 /// Можно ли действовать в окне: need — "click" или "type".
@@ -374,6 +447,9 @@ fn allow_at(args: &Value, x: i32, y: i32) -> Result<(), String> {
 
 fn allow_front(args: &Value) -> Result<(), String> {
     let (pid, app, _) = front().ok_or("no window is in front")?;
+    if pid == unsafe { GetCurrentProcessId() } {
+        return Err("the keyboard focus is in the Fizmat window, not in your target: bring the target forward first (open_application with its name, or click inside it) and repeat".into());
+    }
     allow(args, pid, &app, "type")
 }
 
@@ -393,8 +469,12 @@ fn move_to(x: i32, y: i32) {
     pause(40);
 }
 
+/// Метка нажатий для AutoHotkey (его KEY_IGNORE): переназначения клавиш человека (например, Ctrl↔Win для
+/// Apple-клавиатуры) на нажатия модели не действуют — «ctrl+s» доходит как Ctrl+S. Без AutoHotkey ни на что не влияет.
+const KEY_MARK: usize = 0xFFC3_D44F;
+
 fn key_event(vk: u16, scan: u16, flags: u32) {
-    let input = INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } } };
+    let input = INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: KEY_MARK } } };
     unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
 }
 
@@ -475,7 +555,17 @@ fn with_modifiers<T>(args: &Value, act: impl FnOnce() -> T) -> Result<T, String>
 }
 
 fn click(args: &Value, down: u32, up: u32, times: usize) -> Out {
-    let (x, y) = point(args, "coordinate")?;
+    // Без coordinate, с text — щёлкнуть элемент по названию (role, index — как у ui_press; name — программа).
+    let by_name = args["coordinate"].is_null() && args["text"].as_str().map(|t| !t.trim().is_empty()).unwrap_or(false);
+    let (x, y, what) = if by_name {
+        let (hwnd, _, _) = target(args)?;
+        let index = args["index"].as_u64().unwrap_or(1).clamp(1, 50) as usize;
+        let (x, y, name) = crate::ui::locate(hwnd as isize, args["text"].as_str().unwrap_or(""), args["role"].as_str().filter(|s| !s.trim().is_empty()), index)?;
+        (x, y, format!(" {name}"))
+    } else {
+        let (x, y) = point(args, "coordinate")?;
+        (x, y, String::new())
+    };
     allow_at(args, x, y)?;
     move_to(x, y);
     with_modifiers(args, || {
@@ -489,7 +579,7 @@ fn click(args: &Value, down: u32, up: u32, times: usize) -> Out {
         }
     })?;
     pause(120);
-    ok("Clicked.")
+    ok(format!("Clicked{what}."))
 }
 
 fn type_text(args: &Value) -> Out {
@@ -584,16 +674,30 @@ fn list_windows(args: &Value) -> Out {
     Ok(json!({ "ok": true, "text": lines.join("\n"), "meta": { "apps": seen } }))
 }
 
+/// Вывести вперёд разрешённую программу или запустить её; path — сразу открыть в ней файл (Блокнот, Word, Excel, Paint)
+/// или папку (Проводник). Путь — только существующий, без символов командной строки; Проводнику — только папка (файл он
+/// запустил бы), терминалам и браузерам путь не передаём.
 fn open_application(args: &Value) -> Out {
-    let name = args["name"].as_str().unwrap_or("").trim().to_lowercase();
-    let name = name.trim_end_matches(".exe").to_string();
+    let name = canon(args["name"].as_str().unwrap_or(""));
     if name.is_empty() || name.contains(['/', '\\', '"', '&', '|', '>', '<', '^', '%', ' ']) {
         return Err("name must be a plain application name like «notepad» or «excel»".into());
     }
     if !granted(args, &name) {
         return Err(format!("the application «{name}» is not granted in this chat — ask the person with computer_request_access"));
     }
-    if let Some((hwnd, _, title)) = windows().into_iter().find(|(_, app, _)| *app == name) {
+    let path = args["path"].as_str().map(str::trim).filter(|p| !p.is_empty());
+    if let Some(p) = path {
+        let meta = std::fs::metadata(p).map_err(|_| format!("path «{p}» does not exist on this computer"))?;
+        if p.contains(['"', '&', '|', '>', '<', '^', '%']) {
+            return Err("path must be a plain file or folder path".into());
+        }
+        if tier(&name) != "full" {
+            return Err(format!("«{name}» cannot be opened with a path here"));
+        }
+        if name == "explorer" && !meta.is_dir() {
+            return Err("explorer opens folders only: pass the folder that holds the file".into());
+        }
+    } else if let Some((hwnd, _, title)) = windows().into_iter().find(|(_, app, t)| *app == name && !(name == "explorer" && t == "Program Manager")) {
         unsafe {
             if IsIconic(hwnd) != 0 {
                 ShowWindow(hwnd, SW_RESTORE);
@@ -604,9 +708,26 @@ fn open_application(args: &Value) -> Out {
         return ok(format!("«{name}» is in front: «{title}»."));
     }
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("cmd").args(["/C", "start", "", &name]).creation_flags(0x0800_0000).spawn().map_err(|e| format!("cannot start «{name}»: {e}"))?;
-    pause(1500);
-    ok(format!("Started «{name}». Take a screenshot to see its window."))
+    let before: Vec<isize> = windows().into_iter().filter(|(_, app, _)| *app == name).map(|(h, _, _)| h as isize).collect();
+    let run = if name == "calculatorapp" { "calc" } else { name.as_str() };
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/C", "start", "", run]);
+    if let Some(p) = path {
+        cmd.arg(p);
+    }
+    cmd.creation_flags(0x0800_0000).spawn().map_err(|e| format!("cannot start «{name}»: {e}"))?;
+    // Ждём новое окно (большие программы — до 20 с) и выводим его вперёд.
+    for _ in 0..100 {
+        pause(200);
+        if let Some((hwnd, _, title)) = windows().into_iter().find(|(h, app, _)| *app == name && !before.contains(&(*h as isize))) {
+            pause(500);
+            unsafe { SetForegroundWindow(hwnd) };
+            pause(200);
+            let title = self::title(hwnd).chars().count().gt(&0).then(|| self::title(hwnd)).unwrap_or(title);
+            return ok(format!("Started «{name}»; its window «{title}» is in front."));
+        }
+    }
+    ok(format!("Started «{name}», but its window has not appeared yet — wait and take a screenshot."))
 }
 
 /// Окно для дерева: по имени программы или переднее. Окна самой Fizmat — нет.
@@ -685,13 +806,34 @@ fn one(args: &Value) -> Out {
     if input && locked() {
         return Err(LOCKED.into());
     }
+    let before = front().map(|(_, a, t)| (a, t));
+    let out = act(action, args);
+    // После действия, что меняет экран, — какое окно стало впереди (открылся диалог, фокус ушёл…).
+    let moves = matches!(action, "left_click" | "double_click" | "triple_click" | "right_click" | "key" | "type" | "ui_press" | "ui_set_value" | "left_click_drag");
+    match out {
+        Ok(mut v) if moves => {
+            pause(150);
+            let after = front().map(|(_, a, t)| (a, t));
+            if after != before {
+                if let Some((app, title)) = after {
+                    let note = if granted(args, &app) { "" } else { " (not granted in this chat)" };
+                    v["text"] = Value::String(format!("{} Now in front: {app} — «{title}»{note}.", v["text"].as_str().unwrap_or("")));
+                }
+            }
+            Ok(v)
+        }
+        other => other,
+    }
+}
+
+fn act(action: &str, args: &Value) -> Out {
     match action {
-        "screenshot" => screenshot(),
+        "screenshot" => screenshot(args),
         "zoom" => zoom(args),
         "switch_display" => {
             let n = args["display"].as_u64().unwrap_or(1).max(1) as usize;
             use_display(n - 1)?;
-            screenshot()
+            screenshot(args)
         }
         "cursor_position" => cursor().map(|(x, y)| ok(format!("The mouse is at ({x}, {y}) in the screenshot's pixels."))).unwrap_or_else(|| Err("no cursor".into())),
         "list_windows" => list_windows(args),

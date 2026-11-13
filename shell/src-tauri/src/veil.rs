@@ -213,9 +213,14 @@ pub fn finish(app: &AppHandle) {
 
 /// Окно Fizmat в углу — его не видно на снимках, но щелчок туда попал бы в него.
 pub fn covers(x: i32, y: i32) -> bool {
+    corner().map(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom).unwrap_or(false)
+}
+
+/// Где на рабочем столе стоит окно Fizmat, пока модель управляет компьютером.
+pub fn corner() -> Option<RECT> {
     let s = SESSION.lock().unwrap();
-    let Some((h, _, _)) = s.as_ref().and_then(|s| s.main) else { return false };
+    let (h, _, _) = s.as_ref().and_then(|s| s.main)?;
     let mut r: RECT = unsafe { std::mem::zeroed() };
     unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(h as HWND, &mut r) };
-    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+    (r.right > r.left).then_some(r)
 }
