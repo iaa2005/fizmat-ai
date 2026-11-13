@@ -6,5 +6,6 @@ build/
 dist-guard/
 shell/node_modules/
 shell/src-tauri/target/
+shell/src-tauri/target-*/
 shell/src-tauri/gen/
 *.log

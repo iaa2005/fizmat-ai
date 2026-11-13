@@ -193,13 +193,19 @@ fn guard(path: String, body: Option<Value>, state: tauri::State<Guard>) -> Resul
     }
 }
 
+/// Окно без рамки Windows: кнопки «свернуть / развернуть / закрыть» и шапку, за которую тянут,
+/// рисует сама страница (fizmat.ai, partials/app-frame) — по этому флагу.
+const FRAMELESS: &str = "window.__FZ_FRAMELESS = true;";
+
 /// Окно fizmat.ai. Крестик прячет его в трей: Code ждёт вызовы модели и с закрытым окном.
 fn main_window(app: &AppHandle) {
-    let script = format!("{HERE}\n{THEME}");
+    let script = format!("{FRAMELESS}\n{HERE}\n{THEME}");
     let built = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(START_URL.parse().unwrap()))
         .title("Fizmat")
         .inner_size(1280.0, 860.0)
         .min_inner_size(420.0, 560.0)
+        .decorations(false)
+        .shadow(true)
         .initialization_script(&script)
         .build();
     let Ok(window) = built else { return };
