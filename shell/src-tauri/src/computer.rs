@@ -271,6 +271,14 @@ fn elements(v: &View) -> String {
         }
         _ => {}
     }
+    let behind = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::GW_OWNER) };
+    if !behind.is_null() && owner(behind).0 == pid {
+        if let Ok((list, _)) = crate::ui::brief(behind as isize, &to_shot, 25, Duration::from_millis(700)) {
+            if !list.is_empty() {
+                text.push_str(&format!("\nThe window behind this dialog — «{}»:\n{list}", title(behind)));
+            }
+        }
+    }
     text
 }
 
@@ -1060,8 +1068,20 @@ pub fn run(args: &Value, enabled: bool, stop: &dyn Fn() -> bool) -> Out {
     if !enabled {
         return Err("computer control is switched off in the Fizmat app on this computer — the person turns on Remote Control in Fizmat settings (Настройки → Компьютер)".into());
     }
+    let observe = args["observe"].as_bool().unwrap_or(false);
+    let changes = |a: &str| matches!(a, "left_click" | "double_click" | "triple_click" | "right_click" | "key" | "type" | "ui_press" | "ui_set_value"
+        | "left_click_drag" | "open_application" | "scroll");
+    let seen = || {
+        pause(300);
+        view().map(|v| elements(&v)).unwrap_or_default()
+    };
     if args["action"] != "batch" {
-        return one(args);
+        let out = one(args);
+        if let (true, Ok(mut v)) = (observe && changes(args["action"].as_str().unwrap_or("")), out.clone()) {
+            v["text"] = Value::String(format!("{}{}", v["text"].as_str().unwrap_or(""), seen()));
+            return Ok(v);
+        }
+        return out;
     }
     let list = args["actions"].as_array().cloned().unwrap_or_default();
     let mut results = Vec::new();
@@ -1078,6 +1098,12 @@ pub fn run(args: &Value, enabled: bool, stop: &dyn Fn() -> bool) -> Out {
                 results.push(json!({ "ok": false, "text": format!("action {} ({}) failed: {e}", i + 1, item["action"].as_str().unwrap_or("?")) }));
                 break;
             }
+        }
+    }
+    let last = list.get(results.len().saturating_sub(1)).and_then(|a| a["action"].as_str()).unwrap_or("");
+    if observe && changes(last) {
+        if let Some(r) = results.last_mut() {
+            r["text"] = Value::String(format!("{}{}", r["text"].as_str().unwrap_or(""), seen()));
         }
     }
     Ok(json!({ "ok": true, "text": "", "meta": { "results": results } }))
