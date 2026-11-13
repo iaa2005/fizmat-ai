@@ -209,8 +209,38 @@ pub fn locked() -> bool {
     front().map(|(_, app, _)| app == "lockapp" || app == "logonui").unwrap_or(false)
 }
 
+/// Окно, при котором модель сама выбрала экран (switch_display): пока впереди оно, снимок туда не прыгает.
+static PINNED: Mutex<usize> = Mutex::new(0);
+
+/// Экран переднего окна (не окна Fizmat) — номер в displays().
+fn front_display() -> Option<usize> {
+    use windows_sys::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() || owner(hwnd).0 == unsafe { GetCurrentProcessId() } || *PINNED.lock().unwrap() == hwnd as usize {
+        return None;
+    }
+    let m = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
+    if m.is_null() {
+        return None;
+    }
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(m, &mut info) } == 0 {
+        return None;
+    }
+    displays().iter().position(|r| r.left == info.rcMonitor.left && r.top == info.rcMonitor.top)
+}
+
 fn screenshot(args: &Value) -> Out {
-    let v = view()?;
+    let mut v = view()?;
+    // Несколько экранов: снимок идёт за передним окном — приложение открылось на втором мониторе, модель видит его там.
+    let mut moved = String::new();
+    if displays().len() > 1 {
+        if let Some(d) = front_display().filter(|d| *d != v.display) {
+            v = use_display(d)?;
+            moved = format!(" Switched to display {}: the front window is there.", d + 1);
+        }
+    }
     if locked() {
         // Снимок экрана блокировки модели ничего не даст (а часто и не снимается вовсе).
         return ok(LOCKED);
@@ -218,7 +248,8 @@ fn screenshot(args: &Value) -> Out {
     let cursor = cursor().map(|(x, y)| format!(" The mouse is at ({x}, {y}).")).unwrap_or_default();
     let front = front().map(|(_, name, title)| format!(" Frontmost: {name} — «{title}».")).unwrap_or_default();
     let (nw, nh) = ((v.w as f64 / v.scale).round() as i32, (v.h as f64 / v.scale).round() as i32);
-    let mut out = picture(v.x, v.y, v.w, v.h, v.scale, format!("Screenshot of display {} of {}, {nw}×{nh}; coordinates for clicks are in this image's pixels.{cursor}{front}",
+    let others = if displays().len() > 1 { " Other displays: switch_display with their number." } else { "" };
+    let mut out = picture(v.x, v.y, v.w, v.h, v.scale, format!("Screenshot of display {} of {}, {nw}×{nh}; coordinates for clicks are in this image's pixels.{moved}{others}{cursor}{front}",
         v.display + 1, displays().len()))?;
     if let Some(r) = crate::veil::corner() {
         let (x0, y0) = (((r.left - v.x) as f64 / v.scale).round() as i32, ((r.top - v.y) as f64 / v.scale).round() as i32);
@@ -801,8 +832,15 @@ fn open_application(args: &Value) -> Out {
     use std::os::windows::process::CommandExt;
     let before: Vec<isize> = windows().into_iter().filter(|(_, app, _)| *app == name).map(|(h, _, _)| h as isize).collect();
     let run = if name == "calculatorapp" { "calc" } else { name.as_str() };
+    // Не в PATH (NX, КОМПАС, MATLAB…) — `start ugraf` его не найдёт: запускаем ярлык из «Пуска» или с рабочего стола.
+    let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(format!("{run}.exe")).exists()));
+    let link = if on_path { None } else { shortcut(run) };
     let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", run]);
+    cmd.args(["/C", "start", ""]);
+    match &link {
+        Some(l) => cmd.arg(l),
+        None => cmd.arg(run),
+    };
     if let Some(p) = path {
         cmd.arg(p);
     }
@@ -819,6 +857,47 @@ fn open_application(args: &Value) -> Out {
         }
     }
     ok(format!("Started «{name}», but its window has not appeared yet — wait and take a screenshot."))
+}
+
+/// Ярлык (.lnk) в «Пуске» или на рабочем столе, что ведёт на `<name>.exe`: путь к цели лежит в ярлыке
+/// строкой (ASCII или UTF-16), этого хватает без разбора формата.
+fn shortcut(name: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let needle = format!("\\{}.exe", name.to_lowercase());
+    let wide: Vec<u8> = needle.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let has = |hay: &[u8], pin: &[u8]| hay.windows(pin.len()).any(|w| w == pin);
+    let mut stack: Vec<(PathBuf, usize)> = [("ProgramData", r"Microsoft\Windows\Start Menu\Programs"), ("APPDATA", r"Microsoft\Windows\Start Menu\Programs"),
+        ("PUBLIC", "Desktop"), ("USERPROFILE", "Desktop"), ("USERPROFILE", r"OneDrive\Desktop")]
+        .iter()
+        .filter_map(|(var, sub)| std::env::var(var).ok().map(|b| (Path::new(&b).join(sub), 0)))
+        .collect();
+    let mut looked = 0;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth < 4 {
+                    stack.push((p, depth + 1));
+                }
+                continue;
+            }
+            if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+                continue;
+            }
+            looked += 1;
+            if looked > 3000 {
+                return None;
+            }
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let low: Vec<u8> = bytes.iter().map(u8::to_ascii_lowercase).collect();
+            let plain = !p.to_string_lossy().contains(['"', '&', '|', '>', '<', '^', '%']);
+            if plain && (has(&low, needle.as_bytes()) || has(&low, &wide)) {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// Окно для дерева: по имени программы или переднее. Окна самой Fizmat — нет.
@@ -972,6 +1051,7 @@ fn act(action: &str, args: &Value) -> Out {
         "switch_display" => {
             let n = args["display"].as_u64().unwrap_or(1).max(1) as usize;
             use_display(n - 1)?;
+            *PINNED.lock().unwrap() = unsafe { GetForegroundWindow() } as usize;
             screenshot(args)
         }
         "cursor_position" => cursor().map(|(x, y)| ok(format!("The mouse is at ({x}, {y}) in the screenshot's pixels."))).unwrap_or_else(|| Err("no cursor".into())),

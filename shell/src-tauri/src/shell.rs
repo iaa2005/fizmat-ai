@@ -242,8 +242,21 @@ pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool, tic
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    // Потомки, что держат вывод открытым (фоновые процессы команды), — туда же.
-    job.kill();
+    // Потомки, что держат вывод открытым (фоновые процессы команды), — туда же. Но приложения
+    // с окнами, что команда открыла (Start-Process winword, NX), остаются: их открыли, чтобы с ними работать.
+    if killed.is_some() {
+        job.kill();
+    } else {
+        job.release_apps();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while readers.iter().any(|r| !r.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Вывод всё ещё держит кто-то из оставленных — тогда уж всех.
+    if readers.iter().any(|r| !r.is_finished()) {
+        job.kill();
+    }
     for r in readers {
         let _ = r.join();
     }
@@ -262,9 +275,13 @@ pub fn run(dir: &Path, command: &str, timeout: u64, stop: &dyn Fn() -> bool, tic
 
 #[cfg(windows)]
 mod tree {
+    use std::collections::{HashMap, HashSet};
+    use std::io::Read;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
     use windows_sys::Win32::System::JobObjects::*;
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
 
     /// Job Object с «убить всех при закрытии»: процесс и всё, что он запустит.
     pub struct Job(HANDLE);
@@ -290,6 +307,117 @@ mod tree {
                 unsafe { TerminateJobObject(self.0, 1) };
             }
         }
+
+        /// Команда кончилась сама: оконные приложения (GUI-подсистема) и всё, что они запустили,
+        /// оставить работать — снять с задания «убить при закрытии»; прочих (консольные фоновые) — убить.
+        pub fn release_apps(&self) {
+            if self.0.is_null() {
+                return;
+            }
+            let pids = self.pids();
+            let parents = parents();
+            let gui: HashSet<u32> = pids.iter().copied().filter(|p| is_gui(*p)).collect();
+            if gui.is_empty() {
+                return self.kill();
+            }
+            let keep = |pid: u32| {
+                let mut at = pid;
+                for _ in 0..32 {
+                    if gui.contains(&at) {
+                        return true;
+                    }
+                    match parents.get(&at) {
+                        Some(&up) if up != 0 && up != at => at = up,
+                        _ => return false,
+                    }
+                }
+                false
+            };
+            unsafe {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = 0;
+                SetInformationJobObject(self.0, JobObjectExtendedLimitInformation, &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
+                for pid in pids.into_iter().filter(|p| !keep(*p)) {
+                    let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                    if !h.is_null() {
+                        TerminateProcess(h, 1);
+                        CloseHandle(h);
+                    }
+                }
+            }
+        }
+
+        fn pids(&self) -> Vec<u32> {
+            // JOBOBJECT_BASIC_PROCESS_ID_LIST: два счётчика u32 (вместе — одна ячейка usize), дальше номера по usize.
+            let mut buf = vec![0usize; 1 + 1024];
+            let ok = unsafe {
+                QueryInformationJobObject(self.0, JobObjectBasicProcessIdList, buf.as_mut_ptr() as *mut _,
+                    (buf.len() * std::mem::size_of::<usize>()) as u32, std::ptr::null_mut())
+            };
+            if ok == 0 {
+                return Vec::new();
+            }
+            let n = ((buf[0] as u64 >> 32) as usize).min(1024);
+            buf[1..1 + n].iter().map(|&p| p as u32).collect()
+        }
+    }
+
+    /// Родитель каждого процесса (снимок Toolhelp).
+    fn parents() -> HashMap<u32, u32> {
+        let mut map = HashMap::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return map;
+            }
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snap, &mut e) != 0 {
+                loop {
+                    map.insert(e.th32ProcessID, e.th32ParentProcessID);
+                    if Process32NextW(snap, &mut e) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+        map
+    }
+
+    /// Оконная ли программа: подсистема в PE-заголовке её exe (2 — GUI). Консоль-хозяин — не в счёт.
+    fn is_gui(pid: u32) -> bool {
+        let Some(path) = image(pid) else { return false };
+        let low = path.to_lowercase();
+        if low.ends_with("conhost.exe") || low.ends_with("openconsole.exe") {
+            return false;
+        }
+        let Ok(mut f) = std::fs::File::open(&path) else { return false };
+        let mut head = [0u8; 1024];
+        if f.read(&mut head).unwrap_or(0) < 0x40 {
+            return false;
+        }
+        let pe = u32::from_le_bytes([head[0x3c], head[0x3d], head[0x3e], head[0x3f]]) as usize;
+        if pe + 4 + 20 + 70 > head.len() || &head[pe..pe + 4] != b"PE\0\0" {
+            return false;
+        }
+        let at = pe + 4 + 20 + 68;
+        u16::from_le_bytes([head[at], head[at + 1]]) == 2
+    }
+
+    fn image(pid: u32) -> Option<String> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+            CloseHandle(h);
+            (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+        }
     }
 
     impl Drop for Job {
@@ -311,6 +439,8 @@ mod tree {
         }
 
         pub fn kill(&self) {}
+
+        pub fn release_apps(&self) {}
     }
 }
 
@@ -393,6 +523,19 @@ mod tests {
         let r = run(&dir, long, 60, &|| true, &|_| {}).unwrap();
         assert!(t.elapsed() < Duration::from_secs(10));
         assert_eq!(r["meta"]["killed"], true);
+
+        // Оконное приложение, открытое командой, остаётся работать после неё (раньше умирало вместе с ней).
+        #[cfg(windows)]
+        {
+            let start = if detect().name == "powershell" { "Start-Process notepad.exe -PassThru | ForEach-Object Id" }
+                else { "powershell -NoProfile -Command 'Start-Process notepad.exe -PassThru | ForEach-Object Id'" };
+            let r = run(&dir, start, 60, &|| false, &|_| {}).unwrap();
+            let pid: u32 = r["text"].as_str().unwrap().trim().lines().last().unwrap().trim().parse().expect("pid of notepad");
+            std::thread::sleep(Duration::from_millis(800));
+            let alive = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}")]).output().unwrap();
+            let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).output();
+            assert!(String::from_utf8_lossy(&alive.stdout).contains(&pid.to_string()), "notepad must survive the command");
+        }
 
         // Фоновый потомок держит вывод открытым — Job Object убивает его вместе с командой.
         if detect().name == "bash" {
