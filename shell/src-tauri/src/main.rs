@@ -213,6 +213,10 @@ pub(crate) fn site_window(app: &AppHandle, label: &str, url: tauri::Url) -> Opti
         .shadow(true)
         .initialization_script(&script)
         .on_new_window(move |url, _| links::new_window(&opener, &from, url))
+        .on_navigation({
+            let app = app.clone();
+            move |url| links::navigation(&app, url)
+        })
         .on_download(|webview, event| links::download(&webview, event))
         .build()
         .ok()

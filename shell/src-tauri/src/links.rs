@@ -5,11 +5,16 @@
 // Теперь:
 //   • страница fizmat.ai «в новом окне» (пакет, файл) — в том же окне программы;
 //   • чужой сайт — обычный браузер человека (там и PDF, и всё остальное);
+//   • просмотр файла (PDF или картинка по временной ссылке хранилища, файл чата) — отдельным окном
+//     с обычной рамкой Windows: у просмотрщика PDF нет кнопок окна и «Назад», основное окно
+//     уходить туда не должно — из него было бы не выбраться;
 //   • скачивание — во временную папку, потом окно Windows «Сохранить как», файл — куда выбрали.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use tauri::webview::{DownloadEvent, NewWindowResponse};
-use tauri::{AppHandle, Manager, Url, Webview, Wry};
+use tauri::{AppHandle, Manager, Url, Webview, WebviewUrl, WebviewWindowBuilder, Wry};
 use tauri_plugin_dialog::DialogExt;
 
 /// Страница нашего сайта: её окна получают права программы (capabilities/remote.json).
@@ -18,9 +23,51 @@ pub fn is_site(url: &Url) -> bool {
         && url.host_str().is_some_and(|h| h == "fizmat.ai" || h.ends_with(".fizmat.ai") || h == "new.fizmat.space")
 }
 
-/// `from` — окно, где нажали ссылку: страница сайта открывается в нём же.
+static VIEWS: AtomicU32 = AtomicU32::new(1);
+
+/// Файл, который откроется просмотром, а не скачается: временная ссылка хранилища (S3) или файл
+/// чата/проекта на сайте — без признака скачивания.
+pub fn is_file(url: &Url) -> bool {
+    static ROUTE: OnceLock<regex::Regex> = OnceLock::new();
+    let query = url.query().unwrap_or("").to_lowercase();
+    if query.contains("response-content-disposition=attachment") || query.contains("download=1") {
+        return false;
+    }
+    let route = ROUTE.get_or_init(|| regex::Regex::new(r"^/(c|projects)/[^/]+/files/[^/]+/?$").unwrap());
+    url.host_str() == Some("s3.regru.cloud") || (is_site(url) && route.is_match(url.path()))
+}
+
+/// Основное окно хочет уйти на файл — вместо этого окно просмотра; true — пусть идёт.
+pub fn navigation(app: &AppHandle, url: &Url) -> bool {
+    if is_file(url) {
+        view(app, url.clone());
+        return false;
+    }
+    true
+}
+
+/// Окно просмотра файла: с рамкой Windows (закрыть крестиком), ссылки из него — в браузер.
+pub fn view(app: &AppHandle, url: Url) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let label = format!("view-{}", VIEWS.fetch_add(1, Ordering::SeqCst));
+        let _ = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
+            .title("Fizmat — просмотр файла")
+            .inner_size(1100.0, 820.0)
+            .on_new_window(|u, _| {
+                external(u.as_str());
+                NewWindowResponse::Deny
+            })
+            .on_download(|webview, event| download(&webview, event))
+            .build();
+    });
+}
+
+/// `from` — окно, где нажали ссылку: страница сайта открывается в нём же, файл — окном просмотра.
 pub fn new_window(app: &AppHandle, from: &str, url: Url) -> NewWindowResponse<Wry> {
-    if is_site(&url) {
+    if is_file(&url) {
+        view(app, url);
+    } else if is_site(&url) {
         // Переход — не из обработчика события WebView2, а отдельным потоком.
         let (app, from) = (app.clone(), from.to_string());
         std::thread::spawn(move || {
