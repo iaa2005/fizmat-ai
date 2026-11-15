@@ -211,6 +211,9 @@ pub(crate) fn site_window(app: &AppHandle, label: &str, url: tauri::Url) -> Opti
         .min_inner_size(420.0, 560.0)
         .decorations(false)
         .shadow(true)
+        // Перетаскивание файлов — дело страницы (поле вопроса, чаты, хранилище): свой перехват Tauri
+        // на Windows забирает его у WebView2, и до страницы drop не доходит.
+        .disable_drag_drop_handler()
         .initialization_script(&script)
         .on_new_window(move |url, _| links::new_window(&opener, &from, url))
         .on_navigation({
